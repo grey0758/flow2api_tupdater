@@ -1,5 +1,5 @@
 const token = localStorage.getItem("t") || "";
-const auth = {"Authorization": `Bearer ${token}`, "Content-Type": "application/json"};
+const auth = {"X-Flow-Updater-Authorization": `Bearer ${token}`, "Content-Type": "application/json"};
 const profileSelect = document.getElementById("profile");
 const toast = document.getElementById("toast");
 

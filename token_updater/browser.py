@@ -186,6 +186,34 @@ class BrowserManager:
                     return project_id
         return None
 
+    async def _probe_flow_project_context(
+        self, context: Optional[BrowserContext], project_id: str
+    ) -> bool:
+        """Require a visibly loaded, non-error project page in this context."""
+        normalized = self._normalize_flow_project_id(project_id)
+        if context is None or not normalized:
+            return False
+        denial_markers = (
+            "access denied", "request access", "you don't have access",
+            "you do not have access", "project not found", "doesn't exist",
+            "try signing in with a different account", "unsupported country",
+            "sign in with google", "无权访问", "项目不存在", "换一个账号",
+        )
+        for page in list(context.pages or []):
+            if self._flow_project_id_from_url(getattr(page, "url", "")) != normalized:
+                continue
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                await asyncio.sleep(0.25)
+                if self._flow_project_id_from_url(page.url) != normalized:
+                    continue
+                body = (await page.locator("body").inner_text(timeout=10000)).strip().lower()
+                if body and not any(marker in body for marker in denial_markers):
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def get_flow_project_id(self, profile_id: int) -> Optional[str]:
         """Return a UUID observed in this profile's own Flow browser only."""
         async with self._lock:
@@ -245,30 +273,70 @@ class BrowserManager:
 
             identity = self._normalize_email(result.get("email") or "")
             project_id = await self._discover_flow_project_id(profile_id, context)
-            await self._persist_login_state(
-                profile_id, result["session_token"], email=identity
+            project_accessible = bool(
+                project_id and await self._probe_flow_project_context(context, project_id)
             )
-            if project_id and identity:
+
+            # Revalidate after project discovery.  The owner input channel is
+            # frozen by LoginSlots during this method, but an RFB action sent
+            # just before the freeze can still finish asynchronously.  Bind
+            # only when the final Labs identity, complete Cookie set and
+            # observed project are stable in the same context.
+            await asyncio.sleep(0.25)
+            final = await self._validate_context_session(context, identity)
+            if final.get("success"):
+                try:
+                    checked = validate_google_cookies(
+                        scoped_google_cookies(await context.cookies())
+                    )
+                except Exception:
+                    checked = failure(
+                        "verification_unavailable", "暂无法读取源浏览器 Cookie，请稍后重试"
+                    )
+                if not checked.get("success"):
+                    final = checked
+            final_identity = self._normalize_email(final.get("email") or "")
+            final_project_id = await self._discover_flow_project_id(profile_id, context)
+            if (
+                not final.get("success")
+                or not identity
+                or final_identity != identity
+                or not project_id
+                or final_project_id != project_id
+                or not project_accessible
+                or not await self._probe_flow_project_context(context, final_project_id)
+            ):
+                result = failure(
+                    "context_changed",
+                    "验证期间登录身份或 Flow 项目发生变化，请在同一账号稳定后重试",
+                )
+                self._session_errors[profile_id] = result
+                await self._persist_login_state(profile_id, None)
+                return {
+                    "success": True,
+                    "is_logged_in": False,
+                    "has_flow_project": False,
+                    "profile_name": profile["name"],
+                    "error_code": result["error_code"],
+                    "error": result["error"],
+                }
+
+            await self._persist_login_state(
+                profile_id, final["session_token"], email=final_identity
+            )
+            if final_project_id and final_identity:
                 await profile_db.update_profile(
                     profile_id,
-                    observed_flow_project_id=project_id,
+                    observed_flow_project_id=final_project_id,
                     observed_flow_project_verified=1,
-                    observed_flow_project_identity=identity,
+                    observed_flow_project_identity=final_identity,
                 )
             self._session_errors.pop(profile_id, None)
             return {
                 "success": True,
                 "is_logged_in": True,
-                "has_flow_project": bool(project_id and identity),
+                "has_flow_project": True,
                 "profile_name": profile["name"],
-                **(
-                    {}
-                    if project_id and identity
-                    else {
-                        "error_code": "project_required",
-                        "error": "Labs 已验证，但尚未在同一登录 Profile 中观察到 Flow 项目",
-                    }
-                ),
             }
 
     async def _launch_persistent_context(self, **kwargs):

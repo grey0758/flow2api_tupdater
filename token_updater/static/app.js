@@ -1641,7 +1641,7 @@ async function withButton(button, pendingText, action) {
 async function request(url, options = {}, {allowError = false, auth = true} = {}) {
     const headers = new Headers(options.headers || {});
     if (auth && state.token) {
-        headers.set("Authorization", `Bearer ${state.token}`);
+        headers.set("X-Flow-Updater-Authorization", `Bearer ${state.token}`);
     }
 
     const response = await fetch(url, {...options, headers});

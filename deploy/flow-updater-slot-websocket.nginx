@@ -1,0 +1,14 @@
+# Insert inside the existing HTTPS flow-updater.opencodex.uk server after
+# safe cutover to the isolated release control plane. Inherit the existing
+# server-level independent Basic Auth; do not expose raw worker RFB ports.
+location = /login-slots/vnc/websockify {
+    proxy_pass http://127.0.0.1:18083;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+    proxy_buffering off;
+}

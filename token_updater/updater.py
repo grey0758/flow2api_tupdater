@@ -280,6 +280,27 @@ class TokenSyncer:
         if not profile:
             return {"success": False, "error": "Profile 不存在"}
 
+        if profile.get("login_slot_claimed") and not profile.get("sync_count"):
+            project_identity = browser_manager._normalize_email(
+                profile.get("observed_flow_project_identity") or ""
+            )
+            current_identity = browser_manager._normalize_email(profile.get("email") or "")
+            project_id = browser_manager._normalize_flow_project_id(
+                profile.get("observed_flow_project_id")
+            )
+            if not (
+                profile.get("is_active")
+                and profile.get("is_logged_in")
+                and profile.get("observed_flow_project_verified")
+                and project_id
+                and project_identity
+                and project_identity == current_identity
+            ):
+                return failure(
+                    "onboarding_not_validated",
+                    "并发登录 Profile 尚未完成身份/项目校验并激活；禁止同步",
+                )
+
         flow2api_url, connection_token = self._resolve_target(profile)
         if not flow2api_url or not connection_token:
             error = "未配置完整的 Flow2API 地址或连接 Token"
@@ -404,7 +425,33 @@ class TokenSyncer:
             target_proxy = str(fresh_profile.get("captcha_proxy_url") or "").strip()
             if target_proxy:
                 options["captcha_proxy_url"] = target_proxy
-            return await self._push_to_flow2api(token_to_push, flow2api_url, connection_token, **options)
+            pushed = await self._push_to_flow2api(
+                token_to_push, flow2api_url, connection_token, **options
+            )
+            if fresh_profile.get("login_slot_claimed") and not fresh_profile.get("sync_count"):
+                expected_identity = browser_manager._normalize_email(
+                    fresh_profile.get("email") or ""
+                )
+                returned_identity = browser_manager._normalize_email(
+                    pushed.get("email") or ""
+                )
+                if not pushed.get("success"):
+                    return pushed
+                if not (
+                    pushed.get("oauth_verified") is True
+                    and pushed.get("project_context_accepted") is True
+                    and pushed.get("project_reused") is True
+                    and pushed.get("pending_enable") is True
+                    and pushed.get("account_active") is False
+                    and pushed.get("action") == "added_pending_enable"
+                    and returned_identity
+                    and returned_identity == expected_identity
+                ):
+                    return failure(
+                        "onboarding_acknowledgement_mismatch",
+                        "目标未完整确认同一身份、项目复用及待启用状态；禁止计为同步成功",
+                    )
+            return pushed
 
         result = await push_current_session()
 

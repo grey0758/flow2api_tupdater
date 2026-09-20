@@ -10,6 +10,75 @@ JAR = [{"name": "SID", "value": "root", "domain": ".google.com", "path": "/"},
 
 
 class TokenSyncerMergeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claimed_new_profile_without_verified_project_cannot_sync(self):
+        syncer = TokenSyncer()
+        profile = {
+            "id": 99,
+            "name": "new-slot-profile",
+            "login_slot_claimed": 1,
+            "sync_count": 0,
+            "is_active": 1,
+            "is_logged_in": 1,
+            "email": "owner@example.test",
+            "observed_flow_project_verified": 0,
+            "google_cookies": json.dumps(JAR),
+            "flow2api_url": "http://example.com",
+            "connection_token_override": "token-99",
+        }
+
+        with (
+            patch("token_updater.updater.profile_db.get_profile", AsyncMock(return_value=profile)),
+            patch.object(syncer, "_push_to_flow2api", AsyncMock()) as push_to_flow2api,
+        ):
+            result = await syncer._sync_profile(99)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "onboarding_not_validated")
+        push_to_flow2api.assert_not_awaited()
+
+    async def test_claimed_new_profile_requires_exact_receiver_acknowledgements(self):
+        syncer = TokenSyncer()
+        project_id = "0f6ddfcf-11ce-4a79-9792-b23cc4d189aa"
+        profile = {
+            "id": 100,
+            "name": "new-slot-profile",
+            "login_slot_claimed": 1,
+            "sync_count": 0,
+            "is_active": 1,
+            "is_logged_in": 1,
+            "email": "owner@example.test",
+            "observed_flow_project_verified": 1,
+            "observed_flow_project_id": project_id,
+            "observed_flow_project_identity": "owner@example.test",
+            "google_cookies": json.dumps(JAR),
+            "flow2api_url": "http://example.com",
+            "connection_token_override": "token-100",
+            "error_count": 0,
+        }
+        incomplete = {
+            "success": True,
+            "action": "added_pending_enable",
+            "email": "owner@example.test",
+            "oauth_verified": True,
+            "project_context_accepted": True,
+            "project_reused": False,
+            "pending_enable": True,
+            "account_active": False,
+        }
+
+        with (
+            patch("token_updater.updater.profile_db.get_profile", AsyncMock(return_value=profile)),
+            patch("token_updater.updater.browser_manager.extract_token", AsyncMock(return_value="session")),
+            patch.object(syncer, "_push_to_flow2api", AsyncMock(return_value=incomplete)),
+            patch("token_updater.updater.profile_db.update_profile", AsyncMock()),
+            patch("token_updater.updater.profile_db.record_sync_event", AsyncMock()),
+            patch("token_updater.updater.dashboard_events.publish", AsyncMock()),
+        ):
+            result = await syncer._sync_profile(100)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "onboarding_acknowledgement_mismatch")
+
     async def test_gemini_mode_keeps_gemini_cookie_flow(self):
         syncer = TokenSyncer()
         profile = {

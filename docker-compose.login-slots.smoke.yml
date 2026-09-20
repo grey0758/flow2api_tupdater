@@ -1,0 +1,7 @@
+services:
+  token-updater:
+    volumes:
+      - ${LOGIN_SMOKE_DATA_DIR:?smoke data directory required}:/app/data
+      - ${LOGIN_SMOKE_PROFILES_DIR:?smoke profiles directory required}:/app/profiles
+      - ${LOGIN_SMOKE_LOGS_DIR:?smoke logs directory required}:/app/logs
+      - ./scripts:/smoke:ro

@@ -1,0 +1,22 @@
+ARG BASE_IMAGE=flow2api-token-updater-control:local
+ARG DEPENDENCY_IMAGE=flow2api-token-updater-login-worker:local
+
+FROM ${DEPENDENCY_IMAGE} AS dependency-files
+FROM ${BASE_IMAGE}
+
+# Private deployments may layer the reviewed account-slot change over the
+# accepted v3.4 control image.  The full Dockerfile remains the clean rebuild
+# path; this overlay avoids publishing or rebuilding the unlicensed upstream
+# image and copies only the newly required pinned Ed25519 dependency.
+COPY --from=dependency-files \
+  /usr/local/lib/python3.11/site-packages/cryptography/ \
+  /usr/local/lib/python3.11/site-packages/cryptography/
+COPY --from=dependency-files \
+  /usr/local/lib/python3.11/site-packages/cryptography-44.0.3.dist-info/ \
+  /usr/local/lib/python3.11/site-packages/cryptography-44.0.3.dist-info/
+
+COPY token_updater/ /app/token_updater/
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+USER root
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

@@ -1,0 +1,39 @@
+server {
+    listen 127.0.0.1:38443 ssl;
+    server_name flow-updater.opencodex.uk;
+
+    ssl_certificate /etc/letsencrypt/live/flowapitmp.opencodex.uk/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/flowapitmp.opencodex.uk/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    auth_basic "Flow login slot final-topology smoke";
+    auth_basic_user_file /run/flow-login-slot-smoke.htpasswd;
+
+    add_header Cache-Control "no-store" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "no-referrer" always;
+
+    location = /login-slots/vnc/websockify {
+        proxy_pass http://127.0.0.1:38083;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:38083;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Connection "";
+        proxy_read_timeout 3600s;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        client_max_body_size 2m;
+    }
+}

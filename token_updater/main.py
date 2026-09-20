@@ -49,6 +49,10 @@ async def startup():
 
     await profile_db.init()
     logger.info("数据库初始化完成")
+    if config.login_slot_signing_private_key:
+        from .login_slots import login_slots
+        await login_slots.reconcile()
+        logger.info("独立登录槽位启动对账完成")
 
     scheduler.add_job(
         scheduled_sync,

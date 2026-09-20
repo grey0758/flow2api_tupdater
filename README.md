@@ -199,7 +199,7 @@ docker compose up -d --build
 - `GET /api/auth/check`
 - `GET /api/status`
 - `GET /api/dashboard?hours=6|24|72|168`
-- `GET /api/dashboard/stream`（仅接受 `Authorization: Bearer ...`；浏览器界面默认轮询，避免令牌进入 URL）
+- `GET /api/dashboard/stream`（直接 API 客户端可用 `Authorization: Bearer ...`；位于外层 Basic Auth 后的浏览器控制台使用 `X-Flow-Updater-Authorization: Bearer ...`，默认轮询，避免令牌进入 URL）
 - `GET /api/config`
 - `POST /api/config`
 - `GET /api/profiles`

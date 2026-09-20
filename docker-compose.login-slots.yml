@@ -1,0 +1,252 @@
+name: flow2api-token-updater-login-slots
+
+x-worker-common: &worker-common
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+    - seccomp:deploy/login-worker-seccomp.json
+  network_mode: none
+  mem_limit: 2g
+  mem_reservation: 1536m
+  pids_limit: 320
+  cpus: 2.0
+  shm_size: 512m
+  healthcheck:
+    test: [CMD-SHELL, "test -S /control/worker.sock && kill -0 1"]
+    interval: 10s
+    timeout: 3s
+    retries: 6
+    start_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+x-egress-common: &egress-common
+  image: flow2api-token-updater-login-worker:${IMAGE_TAG:-local}
+  build:
+    context: .
+    dockerfile: Dockerfile.login-worker
+    args:
+      BASE_IMAGE: flow2api-token-updater-control:${IMAGE_TAG:-local}
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  user: "12001:12000"
+  mem_limit: 128m
+  pids_limit: 64
+  cpus: 0.25
+  networks: [updater_internal]
+  tmpfs:
+    - /app/data:ro,nosuid,nodev,noexec,size=64k
+    - /app/logs:ro,nosuid,nodev,noexec,size=64k
+    - /app/profiles:ro,nosuid,nodev,noexec,size=64k
+  healthcheck:
+    test: [CMD-SHELL, "test -S /egress/proxy.sock"]
+    interval: 5s
+    timeout: 2s
+    retries: 12
+
+services:
+  slot-volume-init:
+    image: flow2api-token-updater-login-worker:${IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: Dockerfile.login-worker
+      args:
+        BASE_IMAGE: flow2api-token-updater-control:${IMAGE_TAG:-local}
+    user: "0:0"
+    read_only: true
+    restart: "no"
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - login_profile_1:/init/profile1
+      - login_profile_2:/init/profile2
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/control1:/init/control1
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/control2:/init/control2
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/egress1:/init/egress1
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/egress2:/init/egress2
+    tmpfs:
+      - /app/data:ro,nosuid,nodev,noexec,size=64k
+      - /app/logs:ro,nosuid,nodev,noexec,size=64k
+      - /app/profiles:ro,nosuid,nodev,noexec,size=64k
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        chown 11001:12000 /init/profile1 /init/control1
+        chown 11002:12000 /init/profile2 /init/control2
+        chown 12001:12000 /init/egress1 /init/egress2
+        chmod 0700 /init/profile1 /init/profile2
+        chmod 0770 /init/control1 /init/control2 /init/egress1 /init/egress2
+
+  login-egress-1:
+    <<: *egress-common
+    container_name: flow-login-egress-1
+    depends_on:
+      slot-volume-init:
+        condition: service_completed_successfully
+    volumes:
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/egress1:/egress
+    command: [python, -m, token_updater.login_egress]
+
+  login-egress-2:
+    <<: *egress-common
+    container_name: flow-login-egress-2
+    depends_on:
+      slot-volume-init:
+        condition: service_completed_successfully
+    volumes:
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/egress2:/egress
+    command: [python, -m, token_updater.login_egress]
+
+  login-worker-1:
+    <<: *worker-common
+    image: flow2api-token-updater-login-worker:${IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: Dockerfile.login-worker
+      args:
+        BASE_IMAGE: flow2api-token-updater-control:${IMAGE_TAG:-local}
+        WORKER_UID: "11001"
+    container_name: flow-login-worker-1
+    user: "11001:12000"
+    depends_on:
+      login-egress-1:
+        condition: service_healthy
+    environment:
+      LOGIN_SLOT_NUMBER: "1"
+      LOGIN_SLOT_SIGNING_PUBLIC_KEY: ${LOGIN_SLOT_SIGNING_PUBLIC_KEY:?public control key required}
+      LOGIN_PROFILE_DIR: /slot/profile
+      LOGIN_WORKER_SOCKET: /control/worker.sock
+      LOGIN_EGRESS_SOCKET: /egress/proxy.sock
+      LOGIN_WORKER_RUNTIME_DIR: /run/flow-login-worker
+      DISPLAY: ":99"
+      RESOLUTION: "1365x768x24"
+      HOME: /tmp/login-worker-home
+      LOG_DIR: /tmp/logs
+      LABS_URL: ${LOGIN_SLOT1_LABS_URL:-https://labs.google/fx/tools/flow}
+      PLAYWRIGHT_BROWSERS_PATH: /root/.cache/ms-playwright
+    volumes:
+      - login_profile_1:/slot/profile
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/control1:/control
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/egress1:/egress:ro
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m,uid=11001,gid=12000,mode=1770
+      - /run:rw,nosuid,nodev,size=16m,uid=11001,gid=12000,mode=0700
+      - /app/data:ro,nosuid,nodev,noexec,size=64k
+      - /app/logs:ro,nosuid,nodev,noexec,size=64k
+      - /app/profiles:ro,nosuid,nodev,noexec,size=64k
+
+  login-worker-2:
+    <<: *worker-common
+    image: flow2api-token-updater-login-worker:${IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: Dockerfile.login-worker
+      args:
+        BASE_IMAGE: flow2api-token-updater-control:${IMAGE_TAG:-local}
+        WORKER_UID: "11002"
+    container_name: flow-login-worker-2
+    user: "11002:12000"
+    depends_on:
+      login-egress-2:
+        condition: service_healthy
+    environment:
+      LOGIN_SLOT_NUMBER: "2"
+      LOGIN_SLOT_SIGNING_PUBLIC_KEY: ${LOGIN_SLOT_SIGNING_PUBLIC_KEY:?public control key required}
+      LOGIN_PROFILE_DIR: /slot/profile
+      LOGIN_WORKER_SOCKET: /control/worker.sock
+      LOGIN_EGRESS_SOCKET: /egress/proxy.sock
+      LOGIN_WORKER_RUNTIME_DIR: /run/flow-login-worker
+      DISPLAY: ":99"
+      RESOLUTION: "1365x768x24"
+      HOME: /tmp/login-worker-home
+      LOG_DIR: /tmp/logs
+      LABS_URL: ${LOGIN_SLOT2_LABS_URL:-https://labs.google/fx/tools/flow}
+      PLAYWRIGHT_BROWSERS_PATH: /root/.cache/ms-playwright
+    volumes:
+      - login_profile_2:/slot/profile
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/control2:/control
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/egress2:/egress:ro
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m,uid=11002,gid=12000,mode=1770
+      - /run:rw,nosuid,nodev,size=16m,uid=11002,gid=12000,mode=0700
+      - /app/data:ro,nosuid,nodev,noexec,size=64k
+      - /app/logs:ro,nosuid,nodev,noexec,size=64k
+      - /app/profiles:ro,nosuid,nodev,noexec,size=64k
+
+  token-updater:
+    image: flow2api-token-updater-control:${IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ${CONTROL_CONTAINER_NAME:-flow2api-token-updater}
+    restart: unless-stopped
+    depends_on:
+      login-worker-1:
+        condition: service_healthy
+      login-worker-2:
+        condition: service_healthy
+    cap_drop: [ALL]
+    cap_add: [DAC_READ_SEARCH]
+    group_add: ["12000"]
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:${UPDATER_PORT:-8002}:8002"
+    volumes:
+      - ./data:/app/data
+      - ./profiles:/app/profiles
+      - ./logs:/app/logs
+      - login_profile_1:/app/profiles/.login-slots/slot1/profile:ro
+      - login_profile_2:/app/profiles/.login-slots/slot2/profile:ro
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/control1:/run/login-slot1
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/control2:/run/login-slot2
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?administrator password required}
+      API_KEY: ${API_KEY:-}
+      FLOW2API_URL: ${FLOW2API_URL:-http://172.19.240.1:18087}
+      CONNECTION_TOKEN: ${CONNECTION_TOKEN:?receiver connection secret required}
+      REFRESH_INTERVAL: ${REFRESH_INTERVAL:-120}
+      FLOW_PROTOCOL_REFRESH_ENABLED: ${FLOW_PROTOCOL_REFRESH_ENABLED:-false}
+      SESSION_TTL_MINUTES: ${SESSION_TTL_MINUTES:-1440}
+      ENABLE_VNC: "1"
+      VNC_PASSWORD: ${VNC_PASSWORD:?legacy VNC parser secret required}
+      LOGIN_SLOT_SIGNING_PRIVATE_KEY: ${LOGIN_SLOT_SIGNING_PRIVATE_KEY:?private control key required}
+      LOGIN_SLOT1_WORKER_SOCKET: /run/login-slot1/worker.sock
+      LOGIN_SLOT2_WORKER_SOCKET: /run/login-slot2/worker.sock
+      LOGIN_SLOT1_UID: "11001"
+      LOGIN_SLOT2_UID: "11002"
+      LOGIN_SLOT_EXPECTED_SOURCE_PROXY: http://172.19.240.1:18088
+      LOGIN_SLOT1_PROXY_URL: http://127.0.0.1:18088
+      LOGIN_SLOT2_PROXY_URL: http://127.0.0.1:18088
+    mem_limit: 2g
+    mem_reservation: 1536m
+    pids_limit: 256
+    cpus: 2.0
+    shm_size: 256m
+    networks: [updater_internal]
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  login_profile_1:
+  login_profile_2:
+
+networks:
+  updater_internal:
+    name: ${UPDATER_NETWORK_NAME:-sgp011-flow-updater-v34}
+    external: true

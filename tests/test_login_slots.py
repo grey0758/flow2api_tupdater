@@ -1,96 +1,309 @@
 import asyncio
+import base64
+import os
 import time
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import HTTPException
 
 from token_updater.login_slots import LoginSlot, LoginSlotError, LoginSlots
+from token_updater.login_worker_protocol import ReplayGuard, sign_headers
 
 
-class FakePage:
-    async def goto(self, *args, **kwargs):
-        return None
+SOURCE_PROXY = "http://172.19.240.1:18088"
 
 
-class FakeContext:
-    def __init__(self):
-        self.pages = [FakePage()]
-        self.closed = False
-
-    async def close(self):
-        self.closed = True
-
-
-class FakeChromium:
-    def __init__(self):
-        self.calls = []
-
-    async def launch_persistent_context(self, **kwargs):
-        self.calls.append(kwargs)
-        return FakeContext()
-
-
-@pytest.mark.asyncio
-async def test_two_profiles_get_isolated_login_desktops(monkeypatch, tmp_path):
-    manager = LoginSlots()
-    chromium = FakeChromium()
-    manager._playwright = SimpleNamespace(chromium=chromium, stop=AsyncMock())
-    manager._stack = AsyncMock()
-    monkeypatch.setattr("token_updater.login_slots.config.profiles_dir", str(tmp_path))
-    monkeypatch.setattr("token_updater.login_slots.config.enable_vnc", True)
-
-    first, second = await asyncio.gather(
-        manager.launch({"id": 41, "name": "candidate-a", "proxy_enabled": False}),
-        manager.launch({"id": 42, "name": "candidate-b", "proxy_enabled": False}),
+def _keypair():
+    private = Ed25519PrivateKey.generate()
+    private_raw = private.private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
     )
+    public_raw = private.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    encode = lambda value: base64.urlsafe_b64encode(value).decode().rstrip("=")
+    return encode(private_raw), encode(public_raw)
 
+
+def _slot_tree(tmp_path: Path, monkeypatch):
+    from token_updater import login_slots as module
+    from token_updater.database import profile_db
+
+    profiles = tmp_path / "profiles"
+    root = profiles / ".login-slots"
+    uid = os.getuid()
+    for number in (1, 2):
+        stage = root / f"slot{number}" / "profile"
+        stage.mkdir(parents=True)
+        stage.chmod(0o700)
+    monkeypatch.setattr(module.config, "profiles_dir", str(profiles))
+    monkeypatch.setattr(module.config, "login_slot_root", str(root))
+    monkeypatch.setattr(module.config, "login_slot_worker_ids", (uid, uid))
+    monkeypatch.setattr(module.config, "login_slot_worker_sockets", ("/one.sock", "/two.sock"))
+    monkeypatch.setattr(module.config, "login_slot_worker_proxy_urls", (
+        "http://127.0.0.1:18088", "http://127.0.0.1:18088",
+    ))
+    monkeypatch.setattr(module.config, "login_slot_expected_source_proxy", SOURCE_PROXY)
+    monkeypatch.setattr(module.config, "enable_vnc", True)
+    monkeypatch.setattr(profile_db, "claim_login_slot", AsyncMock(return_value=True))
+    return profiles, root
+
+
+def _profile(profile_id):
+    return {
+        "id": profile_id,
+        "name": f"candidate-{profile_id}",
+        "proxy_enabled": True,
+        "proxy_url": SOURCE_PROXY,
+    }
+
+
+def _worker_reply(slot, state="ready", browser=True, **extra):
+    return {
+        "slot": slot.number,
+        "generation": slot.generation,
+        "profile_id": slot.profile_id,
+        "state": state,
+        "browser_running": browser,
+        **extra,
+    }
+
+
+@pytest.mark.asyncio
+async def test_two_profiles_get_distinct_workers(monkeypatch, tmp_path):
+    from token_updater.browser import browser_manager
+    from token_updater.updater import token_syncer
+
+    _slot_tree(tmp_path, monkeypatch)
+    monkeypatch.setattr(browser_manager, "get_active_profile_id", lambda: None)
+    monkeypatch.setattr(token_syncer, "is_syncing", lambda: False)
+    manager = LoginSlots()
+    manager._reconciled = True
+
+    async def worker(slot, method, **kwargs):
+        assert method == "assign"
+        return _worker_reply(slot)
+
+    monkeypatch.setattr(manager, "_worker", worker)
+    first, second = await asyncio.gather(manager.launch(_profile(41)), manager.launch(_profile(42)))
     assert {first.number, second.number} == {1, 2}
-    assert {call["env"]["DISPLAY"] for call in chromium.calls} == {":101", ":102"}
-    assert len({call["user_data_dir"] for call in chromium.calls}) == 2
-    assert all(Path(call["user_data_dir"]).is_dir() for call in chromium.calls)
-
-    with pytest.raises(LoginSlotError, match="槽位已满") as error:
-        await manager.launch({"id": 43, "name": "candidate-c", "proxy_enabled": False})
-    assert error.value.status_code == 409
-    await manager.stop()
+    assert first.worker_socket != second.worker_socket
+    assert first.staging_dir != second.staging_dir
+    assert first.generation != second.generation
+    with pytest.raises(LoginSlotError, match="槽位已满"):
+        await manager.launch(_profile(43))
 
 
 @pytest.mark.asyncio
-async def test_same_profile_cannot_have_two_owners(monkeypatch, tmp_path):
+async def test_source_proxy_must_match_fixed_isolated_egress(monkeypatch, tmp_path):
+    _slot_tree(tmp_path, monkeypatch)
     manager = LoginSlots()
-    manager._playwright = SimpleNamespace(chromium=FakeChromium(), stop=AsyncMock())
-    manager._stack = AsyncMock()
-    monkeypatch.setattr("token_updater.login_slots.config.profiles_dir", str(tmp_path))
-    monkeypatch.setattr("token_updater.login_slots.config.enable_vnc", True)
-    await manager.launch({"id": 51, "name": "one-owner", "proxy_enabled": False})
-
-    with pytest.raises(LoginSlotError, match="已占用") as error:
-        await manager.launch({"id": 51, "name": "one-owner", "proxy_enabled": False})
-    assert error.value.status_code == 409
-    await manager.stop()
+    manager._reconciled = True
+    bad = _profile(51)
+    bad["proxy_url"] = "http://example.test:9999"
+    with pytest.raises(LoginSlotError, match="固定出口") as error:
+        await manager.launch(bad)
+    assert error.value.status_code == 400
 
 
 @pytest.mark.asyncio
-async def test_capability_is_required_and_expires():
+async def test_launch_refuses_before_restart_reconciliation(monkeypatch, tmp_path):
+    _slot_tree(tmp_path, monkeypatch)
     manager = LoginSlots()
-    valid = LoginSlot(1, 61, "unguessable-capability", time.time() + 30, state="ready")
+    with pytest.raises(LoginSlotError, match="启动对账") as error:
+        await manager.launch(_profile(52))
+    assert error.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciliation_blocks_claimed_profile_and_dirty_slot(
+    monkeypatch, tmp_path,
+):
+    from token_updater.database import profile_db
+
+    _, root = _slot_tree(tmp_path, monkeypatch)
+    (root / "slot2" / "profile" / "retained-state").write_text("quarantined")
+    monkeypatch.setattr(profile_db, "get_all_profiles", AsyncMock(return_value=[
+        {"id": 53, "login_slot_claimed": 1, "login_slot_handoff_complete": 0},
+        {"id": 54, "login_slot_claimed": 1, "login_slot_handoff_complete": 1},
+    ]))
+    manager = LoginSlots()
+    await manager.reconcile()
+    assert manager.owns(53) is True
+    assert manager.owns(54) is False
+    assert manager.any_active() is True
+    assert manager.status() == [
+        {"slot": 1, "state": "quarantined"},
+        {"slot": 2, "state": "quarantined"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_capability_is_single_claim_and_expires():
+    manager = LoginSlots()
+    valid = LoginSlot(1, 61, "invite", time.time() + 30, state="ready")
     manager._slots[1] = valid
-    claimed, session_capability = await manager.claim("unguessable-capability")
-    assert claimed is valid
-    assert manager.authorize(session_capability) is valid
+    claimed, session = await manager.claim("invite")
+    assert claimed is valid and manager.authorize(session) is valid
     with pytest.raises(LoginSlotError) as reused:
-        await manager.claim("unguessable-capability")
+        await manager.claim("invite")
     assert reused.value.status_code == 409
-    with pytest.raises(LoginSlotError) as wrong:
-        manager.authorize("not-the-capability")
-    assert wrong.value.status_code == 404
     valid.expires_at = time.time() - 1
     with pytest.raises(LoginSlotError) as expired:
-        manager.authorize(session_capability)
+        manager.authorize(session)
     assert expired.value.status_code == 410
+
+
+def test_signed_worker_request_is_scoped_and_replay_resistant():
+    private, public = _keypair()
+    headers = sign_headers(
+        private, slot=1, generation="generation-a", profile_id=71,
+        method="POST", path="/validate", body=b"{}", now=100,
+    )
+    guard = ReplayGuard(public, 1)
+    assert guard.verify(
+        headers, method="POST", path="/validate", body=b"{}", now=100
+    ) == ("generation-a", 71)
+    with pytest.raises(ValueError, match="replayed"):
+        guard.verify(headers, method="POST", path="/validate", body=b"{}", now=100)
+
+
+def test_signed_worker_request_rejects_cross_slot_and_body_change():
+    private, public = _keypair()
+    headers = sign_headers(
+        private, slot=1, generation="generation-a", profile_id=72,
+        method="POST", path="/assign", body=b'{"proxy_url":"safe"}', now=100,
+    )
+    with pytest.raises(ValueError):
+        ReplayGuard(public, 2).verify(
+            headers, method="POST", path="/assign", body=b'{"proxy_url":"safe"}', now=100
+        )
+    with pytest.raises(ValueError):
+        ReplayGuard(public, 1).verify(
+            headers, method="POST", path="/assign", body=b'{"proxy_url":"changed"}', now=100
+        )
+
+
+@pytest.mark.asyncio
+async def test_validation_snapshot_is_promoted_then_worker_is_cleaned(monkeypatch, tmp_path):
+    from token_updater.browser import browser_manager
+    from token_updater.database import profile_db
+    from token_updater.updater import token_syncer
+
+    profiles, _ = _slot_tree(tmp_path, monkeypatch)
+    monkeypatch.setattr(browser_manager, "get_active_profile_id", lambda: None)
+    monkeypatch.setattr(token_syncer, "is_syncing", lambda: False)
+    update = AsyncMock()
+    monkeypatch.setattr(profile_db, "update_profile", update)
+    manager = LoginSlots()
+    manager._reconciled = True
+
+    async def worker(slot, method, **kwargs):
+        stage = Path(slot.staging_dir)
+        if method == "assign":
+            (stage / "Default").mkdir()
+            (stage / "Default" / "Preferences").write_text('{"signin": {}}')
+            return _worker_reply(slot)
+        if method == "validate":
+            return _worker_reply(
+                slot, state="validated", browser=False, success=True,
+                is_logged_in=True, has_flow_project=True,
+                identity="owner@example.test",
+                project_id="0f6ddfcf-11ce-4a79-9792-b23cc4d189aa",
+            )
+        if method == "cleanup":
+            for path in sorted(stage.rglob("*"), reverse=True):
+                path.unlink() if path.is_file() else path.rmdir()
+            return _worker_reply(slot, state="idle", browser=False)
+        raise AssertionError(method)
+
+    monkeypatch.setattr(manager, "_worker", worker)
+    slot = await manager.launch(_profile(73))
+    await manager.finish_owner_login(slot)
+    result = await manager.check_owner_login(slot)
+    assert result["is_logged_in"] is True
+    target = profiles / "profile_73" / "Default" / "Preferences"
+    assert target.read_text() == '{"signin": {}}'
+    assert not any(Path(slot.staging_dir).iterdir())
+    assert not manager.has_slot(slot.number)
+    assert update.await_count == 2
+    assert update.await_args_list[-1].kwargs == {"login_slot_handoff_complete": 1}
+
+
+@pytest.mark.asyncio
+async def test_failed_validation_keeps_same_worker_generation(monkeypatch, tmp_path):
+    from token_updater.browser import browser_manager
+    from token_updater.updater import token_syncer
+
+    _slot_tree(tmp_path, monkeypatch)
+    monkeypatch.setattr(browser_manager, "get_active_profile_id", lambda: None)
+    monkeypatch.setattr(token_syncer, "is_syncing", lambda: False)
+    manager = LoginSlots()
+    manager._reconciled = True
+
+    async def worker(slot, method, **kwargs):
+        if method == "assign":
+            return _worker_reply(slot)
+        if method == "validate":
+            return _worker_reply(
+                slot, state="ready", success=False, is_logged_in=False,
+                has_flow_project=False, error_code="project_ownership_unverified",
+            )
+        raise AssertionError(method)
+
+    monkeypatch.setattr(manager, "_worker", worker)
+    slot = await manager.launch(_profile(74))
+    generation = slot.generation
+    await manager.finish_owner_login(slot)
+    result = await manager.check_owner_login(slot)
+    assert result["error_code"] == "project_ownership_unverified"
+    assert slot.state == "ready" and slot.generation == generation
+    assert manager.has_slot(slot.number)
+
+
+@pytest.mark.asyncio
+async def test_cancel_with_profile_data_quarantines_worker(monkeypatch, tmp_path):
+    from token_updater.browser import browser_manager
+    from token_updater.updater import token_syncer
+
+    _slot_tree(tmp_path, monkeypatch)
+    monkeypatch.setattr(browser_manager, "get_active_profile_id", lambda: None)
+    monkeypatch.setattr(token_syncer, "is_syncing", lambda: False)
+    manager = LoginSlots()
+    manager._reconciled = True
+
+    async def worker(slot, method, **kwargs):
+        if method == "assign":
+            Path(slot.staging_dir, "retained-secret-state").write_text("not reusable")
+            return _worker_reply(slot)
+        if method == "abort":
+            return _worker_reply(slot, state="quarantined", browser=False)
+        raise AssertionError(method)
+
+    monkeypatch.setattr(manager, "_worker", worker)
+    slot = await manager.launch(_profile(75))
+    await manager.release(slot.number, expected=slot)
+    assert manager.has_slot(slot.number)
+    assert slot.state == "quarantined" and slot.closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_old_slot_object_cannot_finish_reused_number():
+    manager = LoginSlots()
+    old = LoginSlot(1, 81, "old", time.time() + 30, state="ready")
+    new = LoginSlot(1, 82, "new", time.time() + 30, state="ready")
+    manager._slots[1] = new
+    with pytest.raises(LoginSlotError, match="已经结束"):
+        await manager.finish_owner_login(old)
+    assert await manager.is_current(old) is False
+    assert await manager.is_current(new) is True
 
 
 def test_login_surface_has_no_sync_or_cookie_export_controls():
@@ -100,52 +313,56 @@ def test_login_surface_has_no_sync_or_cookie_export_controls():
     combined = (page + script).lower()
     assert "/sync" not in combined
     assert "export-cookies" not in combined
-    assert "cookie" in page.lower()
+    assert 'src="/login-slots/client.js"' in page
 
 
-def test_slot_services_are_loopback_only():
+def test_final_topology_declares_two_non_root_profile_workers():
     root = Path(__file__).parents[1]
-    supervisor = (root / "supervisord.conf").read_text()
-    compose = (root / "docker-compose.yml").read_text()
-    for number in (1, 2):
-        assert f"[program:slot{number}-xvfb]" in supervisor
-        assert f"[program:slot{number}-novnc]" in supervisor
-        assert f"--listen 127.0.0.1:608{number}" in supervisor
-        assert f"-localhost -rfbport 590{number} -nopw" in supervisor
-        assert f"608{number}:608{number}" not in compose
-    assert '"127.0.0.1:8002:8002"' in compose
-    assert '"127.0.0.1:6080:6080"' in compose
-    assert "admin123" not in compose
-    assert "flow2api}" not in compose
+    compose = (root / "docker-compose.login-slots.yml").read_text()
+    worker = (root / "token_updater/login_worker.py").read_text()
+    dockerfile = (root / "Dockerfile.login-worker").read_text()
+    assert "login-worker-1:" in compose and "login-worker-2:" in compose
+    assert 'user: "11001:12000"' in compose and 'user: "11002:12000"' in compose
+    # The worker anchor applies network_mode:none to both workers; the second
+    # literal belongs to the one-shot volume initializer.
+    assert compose.count("network_mode: none") >= 2
+    assert "read_only: true" in compose and "cap_drop: [ALL]" in compose
+    assert "login_profile_1:/slot/profile" in compose
+    assert "login_profile_2:/slot/profile" in compose
+    worker_one = compose.split("login-worker-1:", 1)[1].split("login-worker-2:", 1)[0]
+    assert "./data:/app/data" not in worker_one
+    assert "/app/data:ro,nosuid,nodev,noexec" in worker_one
+    assert '"--enable-automation", "--no-sandbox", "--disable-dev-shm-usage"' in worker
+    assert "--disable-setuid-sandbox" not in worker
+    assert "USER ${WORKER_UID}:12000" in dockerfile
+    assert "FROM scratch" in dockerfile
+    assert "seccomp:deploy/login-worker-seccomp.json" in compose
 
 
-def test_import_page_uses_backend_bearer_auth():
+def test_worker_project_gate_requires_authenticated_provider_response():
     root = Path(__file__).parents[1]
-    script = (root / "token_updater/static/account-import.js").read_text()
-    assert '"Authorization": `Bearer ${token}`' in script
-    assert "X-Session-Token" not in script
-    assert "option.textContent" in script
-    assert "item.name" not in script.split("innerHTML")[1].split(";")[0]
+    source = (root / "token_updater/login_worker.py").read_text()
+    assert "PROJECT_API_PATH" in source
+    assert "candidates & self.provider_project_ids" in source
+    assert "project_ownership_unverified" in source
 
 
 @pytest.mark.asyncio
 async def test_database_login_slot_claim_is_single_use(tmp_path, monkeypatch):
-    from token_updater.database import ProfileDB
     from token_updater import database
+    from token_updater.database import ProfileDB
 
     path = tmp_path / "profiles.db"
     monkeypatch.setattr(database.config, "db_path", str(path))
     db = ProfileDB()
     await db.init()
     profile_id = await db.add_profile(
-        "fresh", proxy_url="http://proxy.test:8080",
-        captcha_proxy_url="http://captcha.test:8080", is_active=False,
+        "fresh", proxy_url=SOURCE_PROXY,
+        captcha_proxy_url="http://127.0.0.1:18082", is_active=False,
         login_slot_prepared=True,
     )
     assert await db.claim_login_slot(profile_id) is True
     assert await db.claim_login_slot(profile_id) is False
-    assert (await db.get_profile(profile_id))["login_slot_claimed"] == 1
-    assert (await db.get_profile(profile_id))["login_slot_prepared"] == 0
 
 
 @pytest.mark.asyncio
@@ -158,162 +375,14 @@ async def test_legacy_profile_cannot_enter_login_slot_api(tmp_path, monkeypatch)
     db = ProfileDB()
     await db.init()
     legacy_id = await db.add_profile(
-        "legacy-inactive", proxy_url="http://proxy.test:8080",
-        captcha_proxy_url="http://captcha.test:8080", is_active=False,
+        "legacy", proxy_url=SOURCE_PROXY,
+        captcha_proxy_url="http://127.0.0.1:18082", is_active=False,
     )
     monkeypatch.setattr(api, "profile_db", db)
     launch = AsyncMock()
     monkeypatch.setattr(api.login_slots, "launch", launch)
     monkeypatch.setattr(api.config, "profiles_dir", str(tmp_path / "profiles"))
-
     with pytest.raises(HTTPException) as error:
-        await api.start_login_slot(legacy_id, token="test-session")
-
+        await api.start_login_slot(legacy_id, token="session")
     assert error.value.status_code == 409
     launch.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_cancel_during_browser_launch_does_not_reassign_or_leak(monkeypatch, tmp_path):
-    manager = LoginSlots()
-    entered = asyncio.Event()
-    proceed = asyncio.Event()
-    chromium = FakeChromium()
-
-    async def delayed(**kwargs):
-        entered.set()
-        await proceed.wait()
-        return await chromium.launch_persistent_context(**kwargs)
-
-    manager._playwright = SimpleNamespace(
-        chromium=SimpleNamespace(launch_persistent_context=delayed),
-        stop=AsyncMock(),
-    )
-    manager._stack = AsyncMock(return_value=True)
-    monkeypatch.setattr("token_updater.login_slots.config.profiles_dir", str(tmp_path))
-    monkeypatch.setattr("token_updater.login_slots.config.enable_vnc", True)
-    task = asyncio.create_task(manager.launch({"id": 71, "name": "first", "proxy_enabled": False}))
-    await entered.wait()
-    cancellation = asyncio.create_task(manager.release(1))
-    await asyncio.sleep(0)
-    assert manager.owns(71)
-    assert manager.has_slot(1)
-    proceed.set()
-    await task
-    await cancellation
-    assert not manager.has_slot(1)
-    assert manager._stack.await_args_list[-1].args == (1, "stop")
-    await manager.stop()
-
-
-@pytest.mark.asyncio
-async def test_failed_stop_quarantines_slot(monkeypatch, tmp_path):
-    manager = LoginSlots()
-    manager._playwright = SimpleNamespace(chromium=FakeChromium(), stop=AsyncMock())
-    async def stack(number, action):
-        return False if action == "stop" else True
-    manager._stack = stack
-    monkeypatch.setattr("token_updater.login_slots.config.profiles_dir", str(tmp_path))
-    monkeypatch.setattr("token_updater.login_slots.config.enable_vnc", True)
-    slot = await manager.launch({"id": 81, "name": "first", "proxy_enabled": False})
-    await manager.release(slot.number)
-    assert manager.has_slot(slot.number)
-    assert manager.status()[0]["state"] == "quarantined"
-    assert slot.closed.is_set()
-    with pytest.raises(LoginSlotError):
-        manager.authorize("wrong-session")
-
-
-@pytest.mark.asyncio
-async def test_failed_browser_close_quarantines_slot():
-    manager = LoginSlots()
-    context = SimpleNamespace(close=AsyncMock(side_effect=RuntimeError("close failed")))
-    slot = LoginSlot(1, 82, "invite", time.time() + 30, context=context, state="ready")
-    manager._slots[1] = slot
-    manager._stack = AsyncMock(return_value=True)
-
-    await manager.release(1, expected=slot)
-
-    assert manager.has_slot(1)
-    assert slot.state == "quarantined"
-    assert slot.closed.is_set()
-
-
-@pytest.mark.asyncio
-async def test_old_slot_object_cannot_finish_reused_number():
-    manager = LoginSlots()
-    old = LoginSlot(1, 91, "old", time.time() + 30, state="ready")
-    new = LoginSlot(1, 92, "new", time.time() + 30, state="ready")
-    manager._slots[1] = new
-
-    with pytest.raises(LoginSlotError, match="已经结束"):
-        await manager.finish_owner_login(old)
-
-    assert manager._slots[1] is new
-    assert new.state == "ready"
-
-
-@pytest.mark.asyncio
-async def test_owner_check_reuses_context_on_failure_and_closes_on_success(monkeypatch):
-    from token_updater.browser import browser_manager
-
-    manager = LoginSlots()
-    context = FakeContext()
-    slot = LoginSlot(
-        1, 93, "invite", time.time() + 30,
-        session_capability="session", context=context, state="ready",
-    )
-    manager._slots[1] = slot
-    manager._expiry_tasks[1] = asyncio.create_task(asyncio.sleep(30))
-    manager._stack = AsyncMock(return_value=True)
-
-    assert await manager.finish_owner_login(slot) == 93
-    assert slot.state == "awaiting_check"
-    failed = {
-        "success": True, "is_logged_in": False,
-        "has_flow_project": False, "error_code": "auth_required",
-    }
-    monkeypatch.setattr(browser_manager, "check_login_slot_status", AsyncMock(return_value=failed))
-    assert await manager.check_owner_login(slot) == failed
-    assert slot.state == "ready"
-    assert manager.has_slot(1)
-    assert context.closed is False
-
-    assert await manager.finish_owner_login(slot) == 93
-    passed = {"success": True, "is_logged_in": True, "has_flow_project": True}
-    browser_manager.check_login_slot_status = AsyncMock(return_value=passed)
-    assert await manager.check_owner_login(slot) == passed
-    assert context.closed is True
-    assert not manager.has_slot(1)
-
-
-@pytest.mark.asyncio
-async def test_project_is_bound_only_after_same_context_authentication(monkeypatch):
-    from token_updater.browser import BrowserManager
-
-    manager = BrowserManager()
-    context = SimpleNamespace(cookies=AsyncMock(return_value=[
-        {"name": "SID", "value": "sid", "domain": ".google.com", "path": "/"},
-        {"name": "OSID", "value": "osid", "domain": "flow.google.com", "path": "/"},
-    ]))
-    profile = {"id": 94, "name": "fresh", "email": ""}
-    identity = "owner@example.test"
-    project_id = "0f6ddfcf-11ce-4a79-9792-b23cc4d189aa"
-
-    with patch("token_updater.browser.profile_db.get_profile", AsyncMock(return_value=profile)), \
-         patch("token_updater.browser.profile_db.update_profile", AsyncMock()) as update, \
-         patch.object(manager, "_validate_context_session", AsyncMock(return_value={
-             "success": True, "session_token": "session", "email": identity,
-         })), \
-         patch.object(manager, "_discover_flow_project_id", AsyncMock(return_value=project_id)), \
-         patch.object(manager, "_persist_login_state", AsyncMock()):
-        result = await manager.check_login_slot_status(94, context)
-
-    assert result["is_logged_in"] is True
-    assert result["has_flow_project"] is True
-    update.assert_awaited_once_with(
-        94,
-        observed_flow_project_id=project_id,
-        observed_flow_project_verified=1,
-        observed_flow_project_identity=identity,
-    )

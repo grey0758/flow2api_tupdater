@@ -42,6 +42,7 @@ class ProfileDB:
                     connection_token_override TEXT,
                     login_slot_prepared INTEGER DEFAULT 0,
                     login_slot_claimed INTEGER DEFAULT 0,
+                    login_slot_handoff_complete INTEGER DEFAULT 0,
                     observed_flow_project_id TEXT,
                     observed_flow_project_verified INTEGER DEFAULT 0,
                     observed_flow_project_identity TEXT
@@ -78,6 +79,8 @@ class ProfileDB:
                 await db.execute("ALTER TABLE profiles ADD COLUMN login_slot_prepared INTEGER DEFAULT 0")
             if 'login_slot_claimed' not in columns:
                 await db.execute("ALTER TABLE profiles ADD COLUMN login_slot_claimed INTEGER DEFAULT 0")
+            if 'login_slot_handoff_complete' not in columns:
+                await db.execute("ALTER TABLE profiles ADD COLUMN login_slot_handoff_complete INTEGER DEFAULT 0")
             if 'observed_flow_project_id' not in columns:
                 await db.execute("ALTER TABLE profiles ADD COLUMN observed_flow_project_id TEXT")
             if 'observed_flow_project_verified' not in columns:
@@ -188,6 +191,7 @@ class ProfileDB:
                    WHERE id = ?
                    AND COALESCE(login_slot_prepared, 0) = 1
                    AND COALESCE(login_slot_claimed, 0) = 0
+                   AND COALESCE(login_slot_handoff_complete, 0) = 0
                    AND COALESCE(is_active, 0) = 0
                    AND COALESCE(is_logged_in, 0) = 0
                    AND COALESCE(sync_count, 0) = 0

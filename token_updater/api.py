@@ -94,6 +94,7 @@ def _is_fresh_login_slot_profile(profile: Dict[str, Any]) -> bool:
             profile.get("sync_count"),
             profile.get("error_count"),
             profile.get("login_slot_claimed"),
+            profile.get("login_slot_handoff_complete"),
             profile.get("observed_flow_project_verified"),
             *(profile.get(field) for field in empty_fields),
         )
@@ -747,12 +748,20 @@ def _google_browser_seed(raw: str) -> List[Dict[str, Any]]:
     return cookies
 
 
-async def verify_session(authorization: str = Header(None)):
+async def verify_session(
+    authorization: str = Header(None),
+    x_flow_updater_authorization: str = Header(None),
+):
     if not config.admin_password:
         return "anonymous"
-    if not authorization or not authorization.startswith("Bearer "):
+    # The public operator console is additionally protected by Nginx Basic
+    # Auth.  Browsers cannot send Basic and Bearer in the same Authorization
+    # header, so the first-party UI uses a dedicated header while direct API
+    # clients retain the standard Bearer form.
+    session_authorization = x_flow_updater_authorization or authorization
+    if not session_authorization or not session_authorization.startswith("Bearer "):
         raise HTTPException(401, "未登录")
-    return _validate_session_token(authorization[7:])
+    return _validate_session_token(session_authorization[7:])
 
 
 async def verify_api_key(x_api_key: str = Header(None)):
@@ -845,12 +854,6 @@ async def start_login_slot(profile_id: int, token: str = Depends(verify_session)
     except Exception:
         logger.exception("登录槽位启动失败（不记录浏览器数据）")
         raise HTTPException(503, "登录槽位启动失败，请管理员检查服务状态")
-    try:
-        if not await profile_db.claim_login_slot(profile_id):
-            raise HTTPException(409, "Profile 不再符合首次邀请条件")
-    except Exception:
-        await login_slots.release(slot.number, expected=slot)
-        raise
     return {
         "slot": slot.number, "profile_id": profile_id,
         "invite_url": f"/login-slots#{slot.capability}",
@@ -871,6 +874,15 @@ async def cancel_login_slot(number: int, token: str = Depends(verify_session)):
 async def owner_login_page():
     return FileResponse(
         STATIC_DIR / "login-slot.html",
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+
+@app.get("/login-slots/client.js")
+async def owner_login_client():
+    return FileResponse(
+        STATIC_DIR / "login-slot.js",
+        media_type="application/javascript",
         headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
     )
 
@@ -921,12 +933,23 @@ async def login_slot_websocket(websocket: WebSocket):
     except (LoginSlotError, TypeError):
         await websocket.close(code=1008)
         return
+    if websocket.query_params.get("slot") != str(slot.number):
+        await websocket.close(code=1008)
+        return
     try:
-        async with websockets.connect(
-            f"ws://127.0.0.1:{slot.novnc_port}/websockify",
+        async with websockets.unix_connect(
+            slot.worker_socket,
+            uri="ws://login-worker/websockify",
+            additional_headers=login_slots.websocket_headers(slot),
             max_size=8 * 1024 * 1024,
             subprotocols=["binary"],
         ) as backend:
+            # Backend connection can outlive a released slot number.  Recheck
+            # the exact object before accepting so an old invitation can never
+            # observe a replacement owner's desktop.
+            if not await login_slots.is_current(slot):
+                await websocket.close(code=1008)
+                return
             requested = websocket.headers.get("sec-websocket-protocol", "")
             await websocket.accept(subprotocol="binary" if "binary" in requested else None)
             async def to_backend():
@@ -934,13 +957,18 @@ async def login_slot_websocket(websocket: WebSocket):
                     message = await websocket.receive()
                     if message["type"] == "websocket.disconnect":
                         break
-                    if message.get("bytes") is not None:
-                        await backend.send(message["bytes"])
-                    elif message.get("text") is not None:
-                        await backend.send(message["text"])
+                    async with slot.input_gate:
+                        if slot.closed.is_set() or slot.state not in {"ready", "awaiting_check"}:
+                            continue
+                        if message.get("bytes") is not None:
+                            await backend.send(message["bytes"])
+                        elif message.get("text") is not None:
+                            await backend.send(message["text"])
 
             async def to_client():
                 async for message in backend:
+                    if not await login_slots.is_current(slot):
+                        break
                     if isinstance(message, bytes):
                         await websocket.send_bytes(message)
                     else:

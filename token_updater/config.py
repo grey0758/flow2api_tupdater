@@ -64,6 +64,12 @@ class Config(BaseModel):
     db_path: str = "/app/data/profiles.db"
     session_ttl_minutes: int
     config_file: str
+    login_slot_root: str
+    login_slot_worker_sockets: tuple[str, str]
+    login_slot_worker_proxy_urls: tuple[str, str]
+    login_slot_expected_source_proxy: str
+    login_slot_worker_ids: tuple[int, int]
+    login_slot_signing_private_key: str
 
     def save(self) -> None:
         data = {key: getattr(self, key) for key in PERSIST_KEYS}
@@ -93,6 +99,23 @@ def _build_config() -> Config:
         api_port=_parse_int(_get_env("API_PORT"), 8002),
         session_ttl_minutes=_parse_int(_get_env("SESSION_TTL_MINUTES"), 1440),
         config_file=config_file,
+        login_slot_root=_get_env("LOGIN_SLOT_ROOT") or "/app/profiles/.login-slots",
+        login_slot_worker_sockets=(
+            _get_env("LOGIN_SLOT1_WORKER_SOCKET") or "/run/login-slot1/worker.sock",
+            _get_env("LOGIN_SLOT2_WORKER_SOCKET") or "/run/login-slot2/worker.sock",
+        ),
+        login_slot_worker_proxy_urls=(
+            _get_env("LOGIN_SLOT1_PROXY_URL") or "http://127.0.0.1:18088",
+            _get_env("LOGIN_SLOT2_PROXY_URL") or "http://127.0.0.1:18088",
+        ),
+        login_slot_expected_source_proxy=(
+            _get_env("LOGIN_SLOT_EXPECTED_SOURCE_PROXY") or "http://172.19.240.1:18088"
+        ),
+        login_slot_worker_ids=(
+            _parse_int(_get_env("LOGIN_SLOT1_UID"), 11001),
+            _parse_int(_get_env("LOGIN_SLOT2_UID"), 11002),
+        ),
+        login_slot_signing_private_key=_get_env("LOGIN_SLOT_SIGNING_PRIVATE_KEY") or "",
     )
 
 

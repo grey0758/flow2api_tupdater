@@ -28,7 +28,7 @@ async function init() {
   }
   title.textContent = `独立登录槽位 ${session.slot}`;
   instructions.classList.remove("hidden");
-  frame.src = "/login-slots/vnc/vnc.html?autoconnect=1&resize=scale&path=login-slots%2Fvnc%2Fwebsockify";
+  frame.src = `/login-slots/vnc/vnc.html?autoconnect=1&resize=scale&path=${encodeURIComponent(`login-slots/vnc/websockify?slot=${session.slot}`)}`;
   frame.classList.remove("hidden");
 }
 

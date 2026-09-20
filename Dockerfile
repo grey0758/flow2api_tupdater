@@ -52,7 +52,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Playwright Chromium
-RUN playwright install chromium
+RUN playwright install chromium \
+    && chmod a+rx /root /root/.cache \
+    && chmod -R a+rX /root/.cache/ms-playwright
 
 # 应用代码
 COPY token_updater/ /app/token_updater/
@@ -61,7 +63,7 @@ COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 # 目录
 RUN mkdir -p /app/profiles /app/logs /app/data
 
-EXPOSE 6080 6081 6082 8002
+EXPOSE 6080 8002
 
 VOLUME ["/app/profiles", "/app/logs", "/app/data"]
 
