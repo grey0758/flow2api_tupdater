@@ -57,5 +57,8 @@ class ExecutionGate:
             "current": current,
         }
 
+    def is_busy(self) -> bool:
+        return self._lock.locked()
+
 
 execution_gate = ExecutionGate()

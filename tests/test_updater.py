@@ -6,6 +6,26 @@ from token_updater.updater import TokenSyncer
 
 
 class TokenSyncerBatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_protected_inactive_overdue_profile_is_skipped_before_source_login(self):
+        syncer = TokenSyncer()
+        profile = {"id":7, "name":"independent", "email":"independent@example.com",
+                   "flow2api_url":"http://server", "connection_token_override":"test-key",
+                   "last_sync_time":None}
+        token = {"email":profile["email"], "is_active":False, "needs_refresh":True,
+                 "sync_allowed":False, "sync_block_reason":"independent_login"}
+        with (
+            patch("token_updater.updater.profile_db.get_active_profiles", AsyncMock(return_value=[profile])),
+            patch("token_updater.updater.profile_db.update_profile", AsyncMock()),
+            patch("token_updater.updater.profile_db.record_sync_event", AsyncMock()),
+            patch("token_updater.updater.dashboard_events.publish", AsyncMock()),
+            patch.object(syncer, "_check_tokens_status", AsyncMock(return_value={"success":True, "tokens":[token]})),
+            patch.object(syncer, "_sync_profile", AsyncMock()) as sync_profile,
+        ):
+            result = await syncer.sync_all_profiles()
+        sync_profile.assert_not_awaited()
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["error_count"], 0)
+
     async def test_syncs_when_target_token_missing(self):
         syncer = TokenSyncer()
         now = datetime.now()

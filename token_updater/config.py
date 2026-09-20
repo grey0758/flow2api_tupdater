@@ -55,8 +55,11 @@ class Config(BaseModel):
     enable_vnc: bool
     profiles_dir: str = "/app/profiles"
     labs_url: str = "https://labs.google/fx/tools/flow"
+    flow_url: str = "https://flow.google.com/"
+    protocol_refresh_enabled: bool = False
     login_url: str = "https://labs.google/fx/api/auth/signin/google"
     session_cookie_name: str = "__Secure-next-auth.session-token"
+    token_extract_mode: str = "session"
     api_port: int
     db_path: str = "/app/data/profiles.db"
     session_ttl_minutes: int
@@ -71,7 +74,7 @@ def _build_config() -> Config:
     config_file = _get_env("CONFIG_FILE") or "/app/data/config.json"
     persisted = _load_persisted(config_file)
 
-    flow2api_url = _get_env("FLOW2API_URL") or persisted.get("flow2api_url") or "http://host.docker.internal:8000"
+    flow2api_url = _get_env("FLOW2API_URL") or persisted.get("flow2api_url") or "http://host.docker.internal:4020"
     connection_token = _get_env("CONNECTION_TOKEN") or persisted.get("connection_token", "")
     refresh_interval = _parse_int(_get_env("REFRESH_INTERVAL") or str(persisted.get("refresh_interval", 60)), 60)
     enable_vnc = _parse_bool(_get_env("ENABLE_VNC"), default=True)
@@ -83,6 +86,10 @@ def _build_config() -> Config:
         connection_token=connection_token,
         refresh_interval=refresh_interval,
         enable_vnc=enable_vnc,
+        profiles_dir=_get_env("PROFILES_DIR") or "/app/profiles",
+        db_path=_get_env("DB_PATH") or "/app/data/profiles.db",
+        token_extract_mode="session",
+        protocol_refresh_enabled=_parse_bool(_get_env("FLOW_PROTOCOL_REFRESH_ENABLED"), default=False),
         api_port=_parse_int(_get_env("API_PORT"), 8002),
         session_ttl_minutes=_parse_int(_get_env("SESSION_TTL_MINUTES"), 1440),
         config_file=config_file,

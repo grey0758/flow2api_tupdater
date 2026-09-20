@@ -2,7 +2,8 @@
 
 Flow2API Token Updater 是一个轻量级的多账号令牌刷新工具。
 支持两种刷新模式：**协议刷新**（纯 HTTP，无需浏览器）和**浏览器刷新**（Playwright 持久化上下文）。
-优先使用协议刷新，失败时自动回退浏览器模式。
+迁移到 `flow.google.com` 后默认使用浏览器刷新，取得完整 Google/Flow Cookie 与兼容 REST 的 Labs session。
+旧的纯协议刷新仅在 `FLOW_PROTOCOL_REFRESH_ENABLED=true` 时启用，不代表已建立新站会话。
 
 当前版本重点解决三件事：
 
@@ -14,11 +15,11 @@ Flow2API Token Updater 是一个轻量级的多账号令牌刷新工具。
 ## 亮点
 
 - **协议刷新**：无需浏览器，纯 HTTP 请求刷新 session token（由 [Hooper](https://github.com/Hooper27) 提供技术方案）
-- 智能回退：协议刷新失败时自动回退到浏览器模式，浏览器刷新失败则清除过期 cookies
+- 有界回退：协议授权失效时回退源浏览器；目标连接、代理、限流和独立登录保护错误不会触发重复登录或清空源 Cookie
 - 浏览器自动登录：支持自动填写账号密码登录（多语言：中/英/日/韩/西/法/德/葡/俄）
 - 运行时轻量：只有在需要登录时才会启动 VNC / Xvfb / noVNC
 - Cookie 导入：支持导入 Google cookies 进行协议登录，或导入 labs.google cookies 恢复会话
-- 自动转化：浏览器登录成功后自动提取 Google cookies，后续同步自动转为协议刷新
+- 完整会话：浏览器登录后提取带 domain/path/expiry 的 Google/Flow cookies，同步后由目标持久化浏览器继续轮换
 - 智能同步：按最终生效的 Flow2API 地址和令牌分组
 - 单账号覆盖：每个 Profile 都可以覆盖目标地址和连接令牌
 - 代理支持：每个 Profile 都可以使用独立代理
@@ -30,19 +31,26 @@ Flow2API Token Updater 是一个轻量级的多账号令牌刷新工具。
 
 ### 刷新策略
 
-1. 每个账号维护一组 Google cookies（`google_cookies` 字段）。
-2. 同步时，如果 `google_cookies` 存在，优先使用**协议刷新**：
-   - 用 curl_cffi 模拟 Chrome TLS 指纹，通过 Google OAuth 流程获取 labs.google session token
-   - 无需启动浏览器，速度快、资源占用低
-3. 协议刷新失败时，自动清除过期 cookies 并回退到**浏览器刷新**：
-   - 启动 Playwright headless 浏览器，从持久化 Profile 中恢复会话
-   - 成功后自动提取新的 Google cookies，下次同步恢复协议刷新
+1. 每个账号维护独立持久化 Profile 和结构化 Google cookies（`google_cookies` 字段）。
+2. 默认在源 Profile 的代理下打开 Labs/Flow，校验 Labs `/auth/session` 的有效期、邮箱和 `/v1/credits` 实际鉴权，再等待 Flow 主域 Cookie。读到旧 ST、页面打开成功或 session HTTP 200 都不代表授权有效。
+3. 刷新后重新读取最新 Cookie 快照，再同步到目标。目标服务必须确认 Cookie、代理、`oauth_verified=true` 和 `account_active=true`，否则不报告账号已恢复。
+   - Profile 的 `proxy_url` 用于源浏览器；新增 `captcha_proxy_url` 是目标 Flow2API 可访问的同出口代理地址。
+   - 首次同步或 ST 续期变化时必须填写 `captcha_proxy_url`。只有 ST 与目标保存值完全相同且已有代理绑定时，目标才可以沿用已有代理。不会自动复制源服务器的 `127.0.0.1` 地址。
+   - 两台机器地址不同不代表出口不同；必须核对实际公网出口一致。
+   - 协议模式也必须校验授权并发送完整 Cookie；纯文本旧 Cookie 会先进入浏览器补全，不能裸 ST 提交。
 4. 同步结果分组逻辑：
    - 按”最终生效目标地址 + 最终生效令牌”分组
    - 先调用 Flow2API 的 `check-tokens` 接口，只刷新需要刷新的 Profile
-   - 如果目标端检查失败，该分组回退到强制同步
+   - 如果目标端检查失败，该分组记录失败并等待下次调度；不会因服务故障触发全部源账号重新登录
+   - 目标 Flow2API 必须提供带连接 Token 鉴权的 `POST /api/plugin/check-tokens`。404/405 会显示具体接口及 HTTP 状态码；请先补齐/升级接收端，而不是反复重新登录。目标地址填写基础地址，不是完整的 `/api/plugin/update-token` 路径。
+   - 状态响应中的 `sync_allowed=false` 表示目标不允许外部会话同步（如服务器独立登录），智能同步会优先跳过；人工强制同步仍受目标端的防覆盖校验保护。
 
 ### 登录方式
+
+升级顺序：先升级 Flow2API 服务端（支持 `google_cookies`、`oauth_verified`、`account_active` 等确认字段），再升级同步器，
+在每个源 Profile 完成 Labs 授权和 Flow 登录并手动同步。普通列表/API 不返回原始 Google Cookie；不要将 Cookie、页面 XSRF 或签名媒体链接写入日志。
+
+接收确认只表示目标已保存配置，不保证跨机器登录可用。Google 可能存在设备/会话绑定；若目标 native Profile 查询返回 401 或跳转未登录页，需要在目标完成登录验收。不要反复重放 Cookie 或将其误判为流量 429。
 
 | 方式 | 说明 | 自动提取 cookies |
 |------|------|------------------|
@@ -95,14 +103,15 @@ docker compose up -d --build
 
 ### 流程 B：协议 Cookie 导入（推荐）
 
-1. 使用浏览器插件（如 Cookie Editor）导出以下两个域名的 cookies：
+1. 使用浏览器插件（如 Cookie Editor）导出以下域名的 cookies：
    - `.google.com` 域名下的所有 cookies
    - `accounts.google.com` 域名下的所有 cookies
+   - `flow.google.com` 的 cookies（包括 OSID）
 2. 创建一个 Profile。
 3. 点击 `协议登录`，粘贴合并后的 cookies JSON。
-4. 系统自动通过 OAuth 流程获取 session token，后续同步自动走协议刷新。
+4. 系统通过 OAuth 流程获取并校验 session token，然后在源浏览器补全和验证 Flow 登录。后续同步默认仍使用浏览器刷新。
 
-> 提示：两个域名的 cookies 需要合并为一个 JSON 数组导入。
+> 提示：合并为一个 JSON 数组，保留 domain/path/expires，不能将不同域同名 Cookie 压平。Google 二次验证需人工完成。
 
 ### 多实例 Flow2API 配置
 
@@ -207,6 +216,18 @@ docker compose up -d --build
 - `GET /health`
 
 ## 升级说明
+
+### 2026-09-09 会话同步修复
+
+保持源浏览器与目标 Native Profile 分离。本次不迁移数据库、不重置账号、不覆盖服务器独立登录态。
+
+1. 备份并保留 `data/` 和 `profiles/`，部署本次代码；默认保持 `FLOW_PROTOCOL_REFRESH_ENABLED=false`。
+2. 为每个 Flow Profile 配置源 `proxy_url` 和目标可访问的 `captcha_proxy_url`，两端实际公网出口需相同。源代理已启用但地址缺失或无效时停止请求，不回退默认出口。
+3. 先手动同步一个账号，确认响应 `success=true`、`oauth_verified=true`、`account_active=true`，再进行批量同步和目标生成验收。
+4. 提示 Labs 过期时，同步器会在源 Profile 尝试一次正常 OAuth 续期；遇到二次验证或账号选择不一致，需要在源浏览器人工完成。仅重新登录 Flow 新站不会保证 Labs 授权续期。
+5. `account_disabled` 表示会话已保存但账号仍禁用，应检查目标启用设置；`independent_login` 表示目标独立登录保护，需在目标处理，不要反复推送覆盖。
+
+本次本地回归测试覆盖过期授权、撤销 AT、代理异常、Cookie 轮换及目标拒绝；不等同于部署后的真实生成验收。详细检查清单见 [会话修复说明](docs/session-sync-recovery-2026-09-09.md)。
 
 ### 升级到 v3.4
 

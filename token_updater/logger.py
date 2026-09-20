@@ -5,7 +5,7 @@ import os
 from logging.handlers import RotatingFileHandler
 
 # 确保日志目录存在
-log_dir = "/app/logs"
+log_dir = os.getenv("LOG_DIR", "/app/logs")
 os.makedirs(log_dir, exist_ok=True)
 
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()

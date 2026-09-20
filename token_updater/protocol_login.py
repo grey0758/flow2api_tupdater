@@ -2,15 +2,20 @@
 import json
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit, urljoin
 
 from curl_cffi.requests import AsyncSession
 
 from .config import config
 from .logger import logger
 from .proxy_utils import parse_proxy
+from .session_validation import (
+    LABS_SESSION_URL, CREDITS_URL, failure, scoped_google_cookies,
+    validate_labs_session, validate_credits,
+)
 
 # Google OAuth 所需的 cookie 名称
-_GOOGLE_COOKIE_NAMES = ("SID", "HSID", "SSID", "APISID", "SAPISID")
+_GOOGLE_COOKIE_NAMES = ("SID", "__Secure-1PSID", "__Secure-3PSID")
 
 
 def _parse_google_cookies(raw: str) -> Dict[str, str]:
@@ -25,7 +30,7 @@ def _parse_google_cookies(raw: str) -> Dict[str, str]:
         if isinstance(data, list):
             result = {}
             for item in data:
-                if isinstance(item, dict):
+                if isinstance(item, dict) and item.get("domain", ".google.com").lstrip(".") in {"google.com", "accounts.google.com"}:
                     name = item.get("name", "")
                     value = item.get("value", "")
                     if name and value:
@@ -36,7 +41,7 @@ def _parse_google_cookies(raw: str) -> Dict[str, str]:
             if isinstance(cookies_list, list):
                 result = {}
                 for item in cookies_list:
-                    if isinstance(item, dict):
+                    if isinstance(item, dict) and item.get("domain", ".google.com").lstrip(".") in {"google.com", "accounts.google.com"}:
                         name = item.get("name", "")
                         value = item.get("value", "")
                         if name and value:
@@ -86,10 +91,26 @@ def _merge_cookies(cookies: Dict[str, str], headers) -> None:
 def _extract_session_token(headers) -> Optional[str]:
     """从 Set-Cookie 提取 session token"""
     cookie_name = config.session_cookie_name
-    for val in _get_set_cookies(headers):
-        if val.startswith(f"{cookie_name}="):
-            return val.split("=", 1)[1].split(";")[0].strip()
+    values = {}
+    _merge_cookies(values, headers)
+    return _session_token_from_values(values, cookie_name)
+
+
+def _session_token_from_values(values, cookie_name=None) -> Optional[str]:
+    cookie_name = cookie_name or config.session_cookie_name
+    if values.get(cookie_name):
+        return values[cookie_name]
+    prefix = cookie_name + "."
+    chunks = sorted((name for name in values if name.startswith(prefix) and name[len(prefix):].isdigit()),
+                    key=lambda name: int(name[len(prefix):]))
+    if chunks and all(name == prefix + str(i) and values[name] for i, name in enumerate(chunks)):
+        return "".join(values[name] for name in chunks)
     return None
+
+
+def _session_from_jar(session) -> Optional[str]:
+    return _session_token_from_values({c.name: c.value for c in session.cookies.jar
+                                      if c.domain.lstrip(".") == "labs.google" and not c.is_expired()})
 
 
 def _extract_redirect_from_html(text: str) -> Optional[str]:
@@ -157,32 +178,54 @@ class ProtocolLogin:
         输出：{"success": bool, "session_token": str, "error": str}
         """
         google_cookies = _parse_google_cookies(google_cookies_raw)
+        try:
+            parsed_cookies = json.loads(google_cookies_raw)
+        except (ValueError, TypeError):
+            parsed_cookies = None
+        structured = isinstance(parsed_cookies, list) or (isinstance(parsed_cookies, dict) and isinstance(parsed_cookies.get("cookies"), list))
+        seed = scoped_google_cookies(google_cookies_raw)
+        if structured and not any(c["domain"] == ".google.com" and c["name"] in _GOOGLE_COOKIE_NAMES for c in seed):
+            return failure("auth_required", "结构化 Cookie 中缺少有效 Google 主域登录态，请重新导出完整 Cookie")
         has_required = any(name in google_cookies for name in _GOOGLE_COOKIE_NAMES)
         if not has_required:
-            return {
-                "success": False,
-                "error": "未找到有效的 Google cookie（需要 SID/HSID/SSID/APISID/SAPISID 中的至少一个）",
-            }
+            return failure("auth_required", "未找到有效的 Google 登录 Cookie（需要 SID 或 Secure PSID）")
 
         proxy_url = self._get_proxy_url(proxy)
-        session_kwargs = {"impersonate": self.IMPERSONATE}
+        if proxy and not proxy_url:
+            return failure("source_proxy", "源代理地址无效，已停止协议请求以避免走默认出口")
+        session_kwargs = {"impersonate": self.IMPERSONATE, "timeout": 30, "trust_env": False}
         if proxy_url:
             session_kwargs["proxy"] = proxy_url
 
         async with AsyncSession(**session_kwargs) as s:
             try:
+                # Let the scoped jar apply Set-Cookie rotations/deletions. Never
+                # flatten Flow OSID or account-host cookies into a root Cookie header.
+                if not seed:
+                    seed = [{"name": name, "value": value, "domain": ".google.com", "path": "/"}
+                            for name, value in google_cookies.items()]
+                for cookie in seed:
+                    s.cookies.set(cookie["name"], cookie["value"], domain=cookie["domain"],
+                                  path=cookie.get("path", "/"), secure=bool(cookie.get("secure", True)))
+                for cookie in s.cookies.jar:
+                    original = next((c for c in seed if (c["name"], c["domain"], c.get("path", "/")) ==
+                                     (cookie.name, cookie.domain, cookie.path)), {})
+                    expires = original.get("expires", original.get("expirationDate", original.get("expiry")))
+                    if expires is not None and float(expires) > 0:
+                        cookie.expires = int(float(expires))
+                    if original.get("httpOnly"):
+                        cookie.set_nonstandard_attr("HttpOnly", None)
+                    if original.get("sameSite"):
+                        cookie.set_nonstandard_attr("SameSite", original["sameSite"])
                 # 步骤1：获取 CSRF token
                 logger.info("[协议登录] 获取 CSRF token...")
-                resp = await s.get(f"{self.LABS_BASE}/api/auth/csrf")
+                resp = await s.get(f"{self.LABS_BASE}/api/auth/csrf", allow_redirects=False)
                 if resp.status_code != 200:
                     return {"success": False, "error": f"CSRF 失败: HTTP {resp.status_code}"}
 
                 csrf_token = resp.json().get("csrfToken")
                 if not csrf_token:
                     return {"success": False, "error": "CSRF 响应中无 csrfToken"}
-
-                labs_cookies = {}
-                _merge_cookies(labs_cookies, resp.headers)
 
                 # 步骤2：POST signin/google → 获取 OAuth 重定向 URL
                 logger.info("[协议登录] 请求 Google OAuth URL...")
@@ -196,18 +239,16 @@ class ProtocolLogin:
                     headers={
                         "Referer": self.LABS_BASE,
                         "Origin": "https://labs.google",
-                        "Cookie": _build_cookie_header(labs_cookies) if labs_cookies else "",
                     },
                     allow_redirects=False,
                 )
                 if resp.status_code != 200:
                     return {"success": False, "error": f"Signin 失败: HTTP {resp.status_code}"}
 
-                _merge_cookies(labs_cookies, resp.headers)
                 signin_data = resp.json()
                 redirect_url = signin_data.get("redirect") or signin_data.get("url")
                 if not redirect_url:
-                    return {"success": False, "error": f"无重定向 URL: {json.dumps(signin_data)[:200]}"}
+                    return failure("auth_required", "Labs 登录未返回授权地址，请在源浏览器重新授权")
 
                 # 添加 login_hint 跳过账号选择器
                 if email:
@@ -223,15 +264,15 @@ class ProtocolLogin:
 
                 # 步骤3：用 Google cookies 跟随 OAuth 重定向链
                 logger.info("[协议登录] 跟随 Google OAuth 重定向...")
-                google_cookie_header = _build_cookie_header(google_cookies)
                 callback_url = None
                 current_url = redirect_url
 
                 for i in range(10):
+                    if urlsplit(current_url).scheme != "https" or urlsplit(current_url).hostname != "accounts.google.com":
+                        return {"success": False, "error": "Unexpected Google OAuth redirect host"}
                     resp = await s.get(
                         current_url,
                         headers={
-                            "Cookie": google_cookie_header,
                             "Referer": "https://labs.google/" if i == 0 else "https://accounts.google.com/",
                         },
                         allow_redirects=False,
@@ -239,14 +280,14 @@ class ProtocolLogin:
                     location = resp.headers.get("location")
 
                     # 检查是否有 callback URL
-                    check_url = location or ""
-                    if "labs.google/fx/api/auth/callback/google" in check_url:
+                    check_url = urljoin(current_url, location) if location else ""
+                    if urlsplit(check_url).hostname == "labs.google" and urlsplit(check_url).path == "/fx/api/auth/callback/google":
                         callback_url = check_url
                         break
 
                     if location:
-                        logger.info(f"[协议登录] 重定向到: {location[:100]}...")
-                        current_url = location
+                        logger.info(f"[协议登录] 重定向到: {urlsplit(check_url).hostname}")
+                        current_url = check_url
                         continue
 
                     # 没有 Location 头，尝试从 HTML 提取跳转
@@ -262,8 +303,8 @@ class ProtocolLogin:
                             # 相对路径补全为绝对 URL
                             if html_redirect.startswith("/"):
                                 html_redirect = urljoin(current_url, html_redirect)
-                            logger.info(f"[协议登录] 从 HTML 提取到跳转: {html_redirect[:100]}...")
-                            if "labs.google/fx/api/auth/callback/google" in html_redirect:
+                            logger.info(f"[协议登录] 从 HTML 提取到跳转: {urlsplit(html_redirect).hostname}")
+                            if urlsplit(html_redirect).hostname == "labs.google" and urlsplit(html_redirect).path == "/fx/api/auth/callback/google":
                                 callback_url = html_redirect
                                 break
                             current_url = html_redirect
@@ -276,16 +317,17 @@ class ProtocolLogin:
 
                 # 步骤4：访问 callback 换取 session cookie
                 logger.info("[协议登录] 交换 auth code 换取 session...")
+                if urlsplit(callback_url).scheme != "https" or urlsplit(callback_url).hostname != "labs.google":
+                    return {"success": False, "error": "Unexpected OAuth callback host"}
                 resp = await s.get(
                     callback_url,
                     headers={
-                        "Cookie": _build_cookie_header(labs_cookies),
                         "Referer": "https://accounts.google.com/",
                     },
                     allow_redirects=False,
                 )
 
-                session_token = _extract_session_token(resp.headers)
+                session_token = _session_from_jar(s)
 
                 # callback 可能多次重定向，跟随直到拿到 session token
                 for _ in range(5):
@@ -294,23 +336,45 @@ class ProtocolLogin:
                     location = resp.headers.get("location")
                     if not location or resp.status_code not in (301, 302, 303, 307, 308):
                         break
-                    _merge_cookies(labs_cookies, resp.headers)
+                    location = urljoin(callback_url, location)
+                    if urlsplit(location).scheme != "https" or urlsplit(location).hostname != "labs.google":
+                        break
                     resp = await s.get(
                         location,
-                        headers={"Cookie": _build_cookie_header(labs_cookies)},
                         allow_redirects=False,
                     )
-                    session_token = _extract_session_token(resp.headers)
+                    callback_url = location
+                    session_token = _session_from_jar(s)
 
                 if not session_token:
                     return {"success": False, "error": "未获取到 session token，Google session 可能已过期"}
 
+                resp = await s.get(LABS_SESSION_URL, allow_redirects=False)
+                if resp.status_code != 200:
+                    return failure("verification_unavailable", "Labs 会话校验暂不可用，请检查源代理或通过浏览器授权")
+                validated = validate_labs_session(resp.json(), email or "")
+                if not validated["success"]:
+                    return validated
+                resp = await s.get(CREDITS_URL, headers={"Authorization": "Bearer " + validated["access_token"]}, allow_redirects=False)
+                checked = validate_credits(resp.status_code, resp.json() if resp.status_code == 200 else None)
+                if not checked["success"]:
+                    return checked
+                session_token = _session_from_jar(s)
+                if not session_token:
+                    return failure("auth_required", "Labs 会话校验后 Cookie 缺失，请通过源浏览器重新授权")
+                refreshed = scoped_google_cookies([
+                    {"name": c.name, "value": c.value, "domain": c.domain, "path": c.path,
+                     "secure": c.secure, "httpOnly": c.has_nonstandard_attr("HttpOnly"),
+                     **({"sameSite": c.get_nonstandard_attr("SameSite")} if c.has_nonstandard_attr("SameSite") else {}),
+                     "expires": c.expires if c.expires is not None else -1}
+                    for c in s.cookies.jar if not c.is_expired()
+                ])
                 logger.info("[协议登录] 登录成功")
-                return {"success": True, "session_token": session_token}
+                return {"success": True, "session_token": session_token, "email": validated["email"], "google_cookies": refreshed}
 
             except Exception as e:
-                logger.error(f"[协议登录] 异常: {e}")
-                return {"success": False, "error": str(e)}
+                logger.error(f"[协议登录] 异常 ({type(e).__name__})")
+                return failure("verification_unavailable", "协议授权请求失败，请检查源代理或通过浏览器重新授权；未清除 Cookie")
 
 
 protocol_loginer = ProtocolLogin()

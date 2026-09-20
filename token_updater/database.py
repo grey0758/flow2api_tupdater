@@ -61,6 +61,8 @@ class ProfileDB:
                 await db.execute("ALTER TABLE profiles ADD COLUMN connection_token_override TEXT")
             if 'google_cookies' not in columns:
                 await db.execute("ALTER TABLE profiles ADD COLUMN google_cookies TEXT")
+            if 'captcha_proxy_url' not in columns:
+                await db.execute("ALTER TABLE profiles ADD COLUMN captcha_proxy_url TEXT")
             if 'last_check_time' not in columns:
                 await db.execute("ALTER TABLE profiles ADD COLUMN last_check_time TEXT")
             if 'last_check_result' not in columns:
@@ -99,6 +101,7 @@ class ProfileDB:
         proxy_url: str = "",
         flow2api_url: str = "",
         connection_token_override: str = "",
+        captcha_proxy_url: str = "",
     ) -> int:
         """添加 profile"""
         async with aiosqlite.connect(self.db_path) as db:
@@ -113,8 +116,8 @@ class ProfileDB:
                     proxy_enabled,
                     flow2api_url,
                     connection_token_override,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, captcha_proxy_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
@@ -126,6 +129,7 @@ class ProfileDB:
                     flow2api_url,
                     connection_token_override,
                     datetime.now().isoformat(),
+                    captcha_proxy_url,
                 )
             )
             await db.commit()

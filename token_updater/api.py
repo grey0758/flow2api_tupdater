@@ -400,6 +400,7 @@ def _serialize_profile(
     include_secret: bool = False,
 ) -> Dict[str, Any]:
     data = dict(profile)
+    data["has_google_cookies"] = bool(data.pop("google_cookies", None))
     data["is_browser_active"] = data["id"] == active_id
     data["effective_flow2api_url"] = (data.get("flow2api_url") or config.flow2api_url or "").rstrip("/")
     data["uses_default_target"] = not bool(data.get("flow2api_url"))
@@ -509,6 +510,7 @@ class LoginRequest(BaseModel):
 
 
 class CreateProfileRequest(BaseModel):
+    captcha_proxy_url: Optional[str] = ""
     name: str
     remark: Optional[str] = ""
     login_account: Optional[str] = ""
@@ -519,6 +521,7 @@ class CreateProfileRequest(BaseModel):
 
 
 class UpdateProfileRequest(BaseModel):
+    captcha_proxy_url: Optional[str] = None
     name: Optional[str] = None
     remark: Optional[str] = None
     is_active: Optional[bool] = None
@@ -626,6 +629,25 @@ def _build_google_cookie_export(profile: Dict[str, Any]) -> Dict[str, Any]:
         "cookies_json": _json.dumps(cookies, ensure_ascii=False, indent=2),
         "filename": _build_cookie_export_filename(profile["id"], "google"),
     }
+
+
+def _google_browser_seed(raw: str) -> List[Dict[str, Any]]:
+    cookies = []
+    for item in _parse_google_cookie_export(raw):
+        cookie = dict(item)
+        domain = str(cookie.get("domain") or "")
+        if not domain:
+            # Legacy header inputs contain Google login cookies, but OSID is
+            # host-specific and cannot safely be assigned a guessed domain.
+            if cookie.get("name") in {"OSID", "__Secure-OSID"}:
+                continue
+            domain = ".google.com"
+        if domain.lstrip(".") not in {"google.com", "accounts.google.com", "www.google.com", "flow.google.com"} or cookie.get("partitionKey"):
+            continue
+        cookie.update(domain=domain, path=cookie.get("path") or "/")
+        cookie.pop("url", None)
+        cookies.append(cookie)
+    return cookies
 
 
 async def verify_session(authorization: str = Header(None)):
@@ -739,6 +761,7 @@ async def create_profile(request: CreateProfileRequest, token: str = Depends(ver
         login_account=login_account,
         login_password=login_password,
         proxy_url=proxy_url,
+        captcha_proxy_url=_validate_proxy(request.captcha_proxy_url or ""),
         flow2api_url=flow2api_url,
         connection_token_override=connection_token_override,
     )
@@ -765,6 +788,8 @@ async def update_profile(profile_id: int, request: UpdateProfileRequest, token: 
         raise HTTPException(404, "不存在")
 
     update_data: Dict[str, Any] = {}
+    if request.captcha_proxy_url is not None:
+        update_data["captcha_proxy_url"] = _validate_proxy(request.captcha_proxy_url)
     if request.name is not None:
         new_name = _validate_name(request.name)
         existing = await profile_db.get_profile_by_name(new_name)
@@ -987,23 +1012,32 @@ async def protocol_login(profile_id: int, request: ProtocolLoginRequest, token: 
         profile_name=profile.get("name", ""),
     ):
         proxy_url = profile.get("proxy_url") if profile.get("proxy_enabled") else None
+        if profile.get("proxy_enabled") and not proxy_url:
+            raise HTTPException(400, "源 Profile 已启用代理但未填写地址，已停止请求以避免使用默认出口")
         result = await protocol_loginer.login(google_cookies, proxy=proxy_url, email=profile.get("email"))
 
-    if result.get("success") and result.get("session_token"):
-        # 存储 Google cookies 并设置登录模式为协议
-        await profile_db.update_profile(profile_id, google_cookies=google_cookies, login_method="protocol", is_logged_in=1)
-        # 将 session token 写入 profile 的浏览器数据
-        import json as _json
-        session_cookie_json = _json.dumps([{
-            "name": config.session_cookie_name,
-            "value": result["session_token"],
-            "domain": ".labs.google",
-            "path": "/",
-            "secure": True,
-            "httpOnly": True,
-            "sameSite": "Lax",
-        }])
-        await browser_manager.import_cookies(profile_id, session_cookie_json)
+        if result.get("success") and result.get("session_token"):
+            # Keep the browser hydration inside the operation gate, including
+            # Google's scoped cookies and any chunked legacy session cookie.
+            import json as _json
+            seed_cookies = _google_browser_seed(_json.dumps(result["google_cookies"]) if "google_cookies" in result else google_cookies)
+            session = result["session_token"]
+            chunks = [session[i:i + 3800] for i in range(0, len(session), 3800)]
+            for i, chunk in enumerate(chunks):
+                seed_cookies.append({
+                    "name": config.session_cookie_name + (f".{i}" if len(chunks) > 1 else ""),
+                    "value": chunk,
+                    "domain": "labs.google",
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                    "sameSite": "Lax",
+                })
+            imported = await browser_manager.import_cookies(profile_id, _json.dumps(seed_cookies))
+            if not imported.get("success") or not imported.get("has_token"):
+                result = {"success": False, "error": "Google session refreshed, but Flow browser login is incomplete; open Flow and log in"}
+            else:
+                await profile_db.update_profile(profile_id, login_method="protocol", is_logged_in=1)
 
     await dashboard_events.publish(
         "protocol_login",

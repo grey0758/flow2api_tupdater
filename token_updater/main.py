@@ -6,10 +6,11 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from .api import app
 from .browser import browser_manager
-from .updater import token_syncer
-from .database import profile_db
 from .config import config
+from .database import profile_db
+from .execution import execution_gate
 from .logger import logger
+from .updater import token_syncer
 
 
 scheduler = AsyncIOScheduler()
@@ -19,6 +20,17 @@ SYNC_JOB_ID = "token_sync"
 async def scheduled_sync():
     """定时同步任务"""
     logger.info("=== 定时同步任务触发 ===")
+
+    if token_syncer.is_syncing():
+        logger.warning("Scheduled sync skipped: previous sync batch is still running")
+        return
+
+    if execution_gate.is_busy():
+        current = execution_gate.get_status().get("current") or {}
+        logger.warning(
+            f"Scheduled sync skipped: execution gate busy with {current.get('action') or 'another operation'}"
+        )
+        return
 
     profiles = await profile_db.get_active_profiles()
     if not profiles:

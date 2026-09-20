@@ -4,6 +4,11 @@ from token_updater import api
 
 
 class ProfileCredentialHelperTests(unittest.TestCase):
+    def test_google_browser_seed_keeps_flow_host_cookie_scope(self):
+        raw = '[{"name":"OSID","value":"flow","domain":"flow.google.com","path":"/"},{"name":"SID","value":"google","domain":".google.com","path":"/"}]'
+        self.assertEqual(api._google_browser_seed(raw)[0]["domain"], "flow.google.com")
+        self.assertEqual(api._google_browser_seed("SID=value; OSID=unscoped"), [{"name":"SID","value":"value","domain":".google.com","path":"/"}])
+
     def test_parse_account_import_content_supports_two_and_three_columns(self):
         items = api._parse_account_import_content(
             "主账号,alpha@example.com,pass-1\nbeta@example.com,pass-2\n"

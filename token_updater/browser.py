@@ -7,11 +7,19 @@ import shutil
 import subprocess
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+from urllib.parse import parse_qs, urlparse
+from uuid import UUID
 from playwright.async_api import async_playwright, BrowserContext, Playwright
 from .config import config
 from .database import profile_db
 from .proxy_utils import parse_proxy, format_proxy_for_playwright
 from .logger import logger
+from .browser_profile import configure_web_only_profile
+from .session_validation import (
+    LABS_SESSION_URL, LABS_CSRF_URL, LABS_SIGNIN_URL, CREDITS_URL,
+    cookie_is_live, failure, scoped_google_cookies, validate_google_cookies,
+    validate_labs_session, validate_credits,
+)
 
 try:
     import pyautogui
@@ -92,6 +100,102 @@ class BrowserManager:
         self._active_context: Optional[BrowserContext] = None
         self._active_profile_id: Optional[int] = None
         self._lock = asyncio.Lock()
+        self._session_errors: Dict[int, Dict[str, Any]] = {}
+        self._flow_project_ids: Dict[int, str] = {}
+
+    def get_session_error(self, profile_id: int) -> Dict[str, Any]:
+        return self._session_errors.get(profile_id, failure("auth_required", "无法取得完整有效会话，请在源 Profile 完成 Labs 和 Flow 登录"))
+
+    @staticmethod
+    def _normalize_flow_project_id(value: Any) -> Optional[str]:
+        raw = str(value or "").strip()
+        try:
+            return str(UUID(raw))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    @classmethod
+    def _flow_project_id_from_url(cls, value: Any) -> Optional[str]:
+        try:
+            parsed = urlparse(str(value or ""))
+        except Exception:
+            return None
+        host = str(parsed.hostname or "").lower()
+        if host not in {"flow.google.com", "labs.google"}:
+            return None
+
+        candidates: List[str] = []
+        match = re.search(r"(?:^|/)(?:project|projects)/([^/?#]+)", parsed.path, re.IGNORECASE)
+        if match:
+            candidates.append(match.group(1))
+        query = parse_qs(parsed.query)
+        for key in ("projectId", "project_id"):
+            candidates.extend(query.get(key, []))
+        for candidate in candidates:
+            normalized = cls._normalize_flow_project_id(candidate)
+            if normalized:
+                return normalized
+        return None
+
+    def _remember_flow_project_id(
+        self,
+        profile_id: int,
+        context: Optional[BrowserContext],
+        preferred_page: Optional[Any] = None,
+    ) -> Optional[str]:
+        pages = []
+        if preferred_page is not None:
+            pages.append(preferred_page)
+        if context is not None:
+            pages.extend(
+                page for page in list(context.pages or [])
+                if page is not preferred_page
+            )
+        for page in pages:
+            project_id = self._flow_project_id_from_url(getattr(page, "url", ""))
+            if project_id:
+                self._flow_project_ids[int(profile_id)] = project_id
+                return project_id
+        self._flow_project_ids.pop(int(profile_id), None)
+        return None
+
+    async def _discover_flow_project_id(
+        self,
+        profile_id: int,
+        context: BrowserContext,
+    ) -> Optional[str]:
+        remembered = self._remember_flow_project_id(profile_id, context)
+        if remembered:
+            return remembered
+        for page in list(context.pages or []):
+            try:
+                host = str(urlparse(str(page.url or "")).hostname or "").lower()
+                if host not in {"flow.google.com", "labs.google"}:
+                    continue
+                hrefs = await page.locator("a[href]").evaluate_all(
+                    "elements => elements.slice(0, 200).map(element => element.href)"
+                )
+            except Exception:
+                continue
+            for href in hrefs if isinstance(hrefs, list) else []:
+                project_id = self._flow_project_id_from_url(href)
+                if project_id:
+                    self._flow_project_ids[int(profile_id)] = project_id
+                    return project_id
+        return None
+
+    async def get_flow_project_id(self, profile_id: int) -> Optional[str]:
+        """Return a UUID observed in this profile's own Flow browser only."""
+        async with self._lock:
+            if self._active_profile_id == profile_id and self._active_context:
+                return await self._discover_flow_project_id(
+                    profile_id, self._active_context
+                )
+            return self._flow_project_ids.get(int(profile_id))
+
+    async def _launch_persistent_context(self, **kwargs):
+        configure_web_only_profile(kwargs["user_data_dir"])
+        return await self._playwright.chromium.launch_persistent_context(**kwargs)
 
     async def start(self):
         """启动 Playwright"""
@@ -222,12 +326,13 @@ class BrowserManager:
 
     async def _get_proxy(self, profile: Dict[str, Any]) -> Optional[Dict]:
         """获取代理配置"""
-        if profile.get("proxy_enabled") and profile.get("proxy_url"):
-            proxy_config = parse_proxy(profile["proxy_url"])
+        if profile.get("proxy_enabled"):
+            proxy_config = parse_proxy(profile.get("proxy_url") or "")
             if proxy_config:
                 proxy = format_proxy_for_playwright(proxy_config)
                 logger.info(f"[{profile['name']}] 使用代理: {proxy['server']}")
                 return proxy
+            raise ValueError("源 Profile 已启用代理但地址无效，已停止操作以避免使用错误出口")
         return None
 
     async def _safe_page_text(self, page) -> str:
@@ -660,7 +765,7 @@ class BrowserManager:
             login_password,
             submit_selectors=PASSWORD_SUBMIT_SELECTORS,
             submit_patterns=["下一步", "Next", "继续", "Continue", "登录", "Sign in", "次へ", "続行", "로그인", "Iniciar sesión", "Connexion", "Anmelden", "Fazer login", "Войти"],
-            success_selectors=["[href*='labs.google']", "[data-test-id='profile-menu-button']"],
+            success_selectors=["[href*='labs.google']", "[href*='flow.google.com']", "[data-test-id='profile-menu-button']"],
         ):
             return True
         return False
@@ -825,8 +930,9 @@ class BrowserManager:
         return False
 
     async def _is_labs_session_ready(self, page, body_text: str) -> bool:
+        """Page readiness only. Never use this as proof of OAuth validity."""
         url = str(page.url or "").lower()
-        if "labs.google" not in url:
+        if urlparse(url).hostname not in {"labs.google", "flow.google.com"}:
             return False
         if "accounts.google.com" in url:
             return False
@@ -868,6 +974,18 @@ class BrowserManager:
                 pass
 
             body_text = await self._safe_page_text(page)
+
+            blocker = self._detect_login_blocker(body_text)
+            if blocker:
+                self._session_errors[profile["id"]] = failure("manual_action_required", blocker)
+                return None
+            if urlparse(str(page.url)).hostname == "accounts.google.com":
+                account = self._resolve_known_email(profile) or ""
+                if account and await self._click_account_choice(page, account):
+                    continue
+                if profile.get("login_account") and profile.get("login_password"):
+                    if await self._advance_google_login(page, profile["login_account"], profile["login_password"]):
+                        continue
 
             if native_prompt_attempts < 3 and not str(body_text or "").strip() and await self._handle_native_chrome_profile_prompts():
                 native_prompt_attempts += 1
@@ -913,6 +1031,122 @@ class BrowserManager:
                 break
         return token
 
+    async def _validate_context_session(self, context: BrowserContext, expected_email: str = "") -> Dict[str, Any]:
+        """Share the source context's cookie jar AND proxy, never a default HTTP route."""
+        responses = []
+        try:
+            response = await context.request.get(LABS_SESSION_URL, timeout=20000, max_redirects=0,
+                                                 headers={"Accept": "application/json"})
+            responses.append(response)
+            if response.status == 401:
+                return failure("auth_required", "Labs 授权已失效，请在源 Profile 重新授权")
+            if response.status != 200:
+                return failure("verification_unavailable", "Labs 会话校验暂不可用，请检查源代理或稍后重试")
+            validated = validate_labs_session(await response.json(), expected_email)
+            if not validated["success"]:
+                return validated
+            response = await context.request.get(CREDITS_URL, timeout=20000, max_redirects=0,
+                                                 headers={"Authorization": "Bearer " + validated["access_token"]})
+            responses.append(response)
+            data = await response.json() if response.status == 200 else None
+            checked = validate_credits(response.status, data)
+            if not checked["success"]:
+                return checked
+            # /auth/session may rotate/chunk the ST. Read AFTER validation.
+            token = await self._get_session_cookie(context)
+            if not token:
+                return failure("auth_required", "Labs 会话 Cookie 缺失，请重新完成 Labs 授权")
+            return {"success": True, "session_token": token, "email": validated["email"]}
+        except Exception as exc:
+            logger.warning(f"Source session validation failed ({type(exc).__name__}); credentials retained")
+            return failure("verification_unavailable", "源账号鉴权请求失败，请检查代理连接或稍后重试；未清除 Cookie")
+        finally:
+            for response in responses:
+                try:
+                    await response.dispose()
+                except Exception:
+                    pass
+
+    async def _start_labs_authorization(self, context: BrowserContext, page) -> bool:
+        """One normal NextAuth sign-in, without clearing either site's cookies."""
+        responses = []
+        try:
+            response = await context.request.get(LABS_CSRF_URL, timeout=20000, max_redirects=0)
+            responses.append(response)
+            if response.status != 200:
+                return False
+            csrf = (await response.json()).get("csrfToken")
+            if not isinstance(csrf, str) or not csrf:
+                return False
+            response = await context.request.post(
+                LABS_SIGNIN_URL, form={"csrfToken": csrf, "callbackUrl": "https://labs.google/fx", "json": "true"},
+                headers={"Origin": "https://labs.google", "Referer": "https://labs.google/fx"},
+                timeout=20000, max_redirects=0,
+            )
+            responses.append(response)
+            if response.status != 200:
+                return False
+            data = await response.json()
+            target = data.get("url") or data.get("redirect")
+            parsed = urlparse(target) if isinstance(target, str) else None
+            if not parsed or parsed.scheme != "https" or parsed.hostname != "accounts.google.com" or parsed.username or parsed.port not in (None, 443):
+                return False
+            await page.goto(target, wait_until="domcontentloaded", timeout=60000)
+            return True
+        except Exception as exc:
+            logger.warning(f"Labs authorization could not start ({type(exc).__name__})")
+            return False
+        finally:
+            for response in responses:
+                try:
+                    await response.dispose()
+                except Exception:
+                    pass
+
+    async def _ensure_labs_authorization(self, profile, context, page) -> Dict[str, Any]:
+        expected_email = self._resolve_known_email(profile) or ""
+        result = await self._validate_context_session(context, expected_email)
+        if result.get("error_code") == "auth_required":
+            logger.info(f"[{profile['name']}] Labs OAuth needs renewal; starting one source-profile sign-in")
+            if await self._start_labs_authorization(context, page):
+                await self._settle_labs_session(profile, context, page)
+                if self._session_errors.get(profile["id"], {}).get("error_code") == "manual_action_required":
+                    return self._session_errors[profile["id"]]
+                result = await self._validate_context_session(context, expected_email)
+        if not result["success"]:
+            self._session_errors[profile["id"]] = result
+        return result
+
+    async def _complete_flow_session(self, profile, context, page) -> Optional[str]:
+        result = await self._ensure_labs_authorization(profile, context, page)
+        if result["success"]:
+            if urlparse(str(page.url)).hostname != "flow.google.com":
+                await page.goto(config.flow_url, wait_until="domcontentloaded", timeout=60000)
+            await self._wait_for_flow_cookies(context)
+            location = urlparse(str(page.url))
+            if location.hostname != "flow.google.com" or location.path.rstrip("/") == "/about":
+                result = failure("cookies_incomplete", "源浏览器仍停留在 Flow 未登录页面，请完成 Flow 登录后同步")
+            elif not await self._save_google_cookies_from_context(profile["id"], context):
+                result = failure("cookies_incomplete", "Flow/Google 登录 Cookie 不完整，请在源 Profile 完成 Flow 登录")
+            else:
+                self._remember_flow_project_id(profile["id"], context, page)
+        if not result["success"]:
+            self._session_errors[profile["id"]] = result
+            await self._persist_login_state(profile["id"], None)
+            return None
+        # Flow navigation can rotate cookies too; don't return an earlier ST snapshot.
+        token = await self._get_session_cookie(context)
+        if token != result.get("session_token"):
+            checked = await self._validate_context_session(context, result["email"])
+            if not checked["success"]:
+                self._session_errors[profile["id"]] = checked
+                await self._persist_login_state(profile["id"], None)
+                return None
+            token = checked["session_token"]
+        await self._persist_login_state(profile["id"], token, email=result["email"])
+        self._session_errors.pop(profile["id"], None)
+        return token
+
     async def _persist_login_state(
         self,
         profile_id: int,
@@ -921,6 +1155,8 @@ class BrowserManager:
         is_logged_in: Optional[bool] = None,
     ) -> None:
         logged_in = bool(token) if is_logged_in is None else bool(is_logged_in)
+        if not logged_in:
+            self._flow_project_ids.pop(int(profile_id), None)
         update_data: Dict[str, Any] = {"is_logged_in": 1 if logged_in else 0}
         if token:
             update_data["last_token"] = self._mask_token(token)
@@ -935,26 +1171,29 @@ class BrowserManager:
         self,
         profile_id: int,
         context: BrowserContext,
-    ) -> None:
+    ) -> bool:
         """从浏览器上下文提取 Google cookies 并存储，用于后续协议刷新"""
         try:
             all_google_cookies = []
-            for domain in [".google.com", "accounts.google.com"]:
+            for domain in ["google.com", "www.google.com", "accounts.google.com", "flow.google.com"]:
                 try:
                     cookies = await context.cookies(f"https://{domain}")
                     all_google_cookies.extend(cookies)
                 except Exception:
                     pass
 
-            if not all_google_cookies:
-                return
-
-            # 转为 JSON 存储
+            all_google_cookies = scoped_google_cookies(all_google_cookies)
+            checked = validate_google_cookies(all_google_cookies)
+            if not checked["success"]:
+                logger.warning(f"[Profile {profile_id}] {checked['error']}; previous snapshot retained")
+                return False
             google_cookies_json = json.dumps(all_google_cookies)
             await profile_db.update_profile(profile_id, google_cookies=google_cookies_json)
             logger.info(f"[Profile {profile_id}] 已从浏览器提取 {len(all_google_cookies)} 个 Google cookies 用于协议刷新")
+            return True
         except Exception as e:
-            logger.warning(f"[Profile {profile_id}] 提取 Google cookies 失败: {e}")
+            logger.warning(f"[Profile {profile_id}] 提取 Google cookies 失败 ({type(e).__name__})")
+            return False
 
     def _parse_cookies_payload(self, cookies_json: str) -> List[Dict[str, Any]]:
         data = json.loads(cookies_json)
@@ -1021,15 +1260,27 @@ class BrowserManager:
             out.append(cookie)
         return out
 
+    async def _wait_for_flow_cookies(self, context: BrowserContext) -> None:
+        for _ in range(10):
+            cookies = await context.cookies(config.flow_url)
+            if any(c.get("domain", "").lstrip(".") == "flow.google.com" and c.get("name") in {"OSID", "__Secure-OSID"} for c in cookies):
+                return
+            await asyncio.sleep(0.5)
+
     async def _get_session_cookie(self, context: BrowserContext) -> Optional[str]:
         try:
-            cookies = await context.cookies("https://labs.google")
+            cookies = await context.cookies(LABS_SESSION_URL)
         except Exception:
             cookies = await context.cookies()
 
-        for cookie in cookies:
+        scoped = [c for c in cookies if c.get("domain", "").lstrip(".") == "labs.google" and cookie_is_live(c)]
+        for cookie in scoped:
             if cookie.get("name") == config.session_cookie_name:
                 return cookie.get("value")
+        prefix = config.session_cookie_name + "."
+        chunks = sorted((c for c in scoped if c.get("name", "").startswith(prefix) and c["name"][len(prefix):].isdigit()), key=lambda c: int(c["name"][len(prefix):]))
+        if chunks and all(c["name"] == prefix + str(i) for i, c in enumerate(chunks)):
+            return "".join(c["value"] for c in chunks)
         return None
 
     async def import_cookies(self, profile_id: int, cookies_json: str) -> Dict[str, Any]:
@@ -1064,7 +1315,7 @@ class BrowserManager:
                 self._clean_locks(profile_dir)
                 proxy = await self._get_proxy(profile)
 
-                context = await self._playwright.chromium.launch_persistent_context(
+                context = await self._launch_persistent_context(
                     user_data_dir=profile_dir,
                     headless=True,
                     viewport={"width": 1024, "height": 768},
@@ -1118,7 +1369,7 @@ class BrowserManager:
 
                     self._clean_locks(profile_dir)
                     proxy = await self._get_proxy(profile)
-                    context = await self._playwright.chromium.launch_persistent_context(
+                    context = await self._launch_persistent_context(
                         user_data_dir=profile_dir,
                         headless=True,
                         viewport={"width": 1024, "height": 768},
@@ -1162,6 +1413,7 @@ class BrowserManager:
             logger.warning("已禁用 VNC 登录（设置 ENABLE_VNC=1 可启用）")
             return False
         async with self._lock:
+            self._flow_project_ids.pop(int(profile_id), None)
             await self._close_active()
 
             profile = await profile_db.get_profile(profile_id)
@@ -1184,7 +1436,7 @@ class BrowserManager:
                 proxy = await self._get_proxy(profile)
 
                 # 非 headless，用于 VNC 登录
-                self._active_context = await self._playwright.chromium.launch_persistent_context(
+                self._active_context = await self._launch_persistent_context(
                     user_data_dir=profile_dir,
                     headless=False,  # VNC 可见
                     viewport={"width": 1024, "height": 768},
@@ -1197,7 +1449,7 @@ class BrowserManager:
                 self._active_profile_id = profile_id
 
                 page = self._active_context.pages[0] if self._active_context.pages else await self._active_context.new_page()
-                await page.goto(config.labs_url, wait_until="domcontentloaded")
+                await page.goto(config.labs_url, wait_until="domcontentloaded", timeout=90000)
 
                 logger.info(f"[{profile['name']}] 浏览器已启动，请通过 VNC 登录")
                 return True
@@ -1213,34 +1465,35 @@ class BrowserManager:
                 return {"success": False, "error": "该 Profile 浏览器未运行"}
 
             if self._active_context:
-                # 检查登录状态
-                is_logged_in = False
                 profile = await profile_db.get_profile(profile_id)
-                try:
-                    cookies = await self._active_context.cookies("https://labs.google")
-                    is_logged_in = any(c["name"] == config.session_cookie_name for c in cookies)
-                except Exception:
-                    pass
-
-                await self._persist_login_state(
-                    profile_id,
-                    None,
-                    email=self._resolve_known_email(profile or {}),
-                    is_logged_in=is_logged_in,
-                )
-                if is_logged_in:
-                    await self._save_google_cookies_from_context(profile_id, self._active_context)
+                token = await self._extract_from_context(profile, self._active_context) if profile else None
+                is_logged_in = bool(token)
                 await self._close_active()
                 await self._stop_vnc_stack()
 
                 status = "已登录" if is_logged_in else "未登录"
                 logger.info(f"Profile {profile_id} 浏览器已关闭，状态: {status}")
-                return {"success": True, "is_logged_in": is_logged_in}
+                return {"success": True, "is_logged_in": is_logged_in,
+                        **({"error": self.get_session_error(profile_id)["error"]} if not is_logged_in else {})}
 
             return {"success": True}
 
+    async def abort_active_browser(self, profile_id: Optional[int] = None) -> bool:
+        """Force close the active browser without persisting login state."""
+        async with self._lock:
+            if self._active_context is None:
+                return False
+            if profile_id is not None and self._active_profile_id != profile_id:
+                return False
+            try:
+                await self._close_active()
+            finally:
+                await self._stop_vnc_stack()
+            return True
+
     async def extract_token(self, profile_id: int) -> Optional[str]:
         """提取 Token（Headless 模式，使用持久化上下文）"""
+        self._session_errors.pop(profile_id, None)
         async with self._lock:
             profile = await profile_db.get_profile(profile_id)
             if not profile:
@@ -1249,7 +1502,7 @@ class BrowserManager:
             profile_dir = self._get_profile_dir(profile_id)
 
             # 检查是否有持久化数据
-            if not os.path.exists(profile_dir):
+            if not os.path.exists(profile_dir) and not profile.get("google_cookies"):
                 logger.warning(f"[{profile['name']}] 无持久化数据，请先登录")
                 return None
 
@@ -1268,9 +1521,11 @@ class BrowserManager:
                 proxy = await self._get_proxy(profile)
 
                 logger.info(f"[{profile['name']}] Headless 模式提取 Token...")
+                seed_cookies = not os.path.exists(profile_dir)
+                os.makedirs(profile_dir, exist_ok=True)
 
                 # Headless + 持久化上下文
-                context = await self._playwright.chromium.launch_persistent_context(
+                context = await self._launch_persistent_context(
                     user_data_dir=profile_dir,
                     headless=True,  # Headless 省资源
                     viewport={"width": 1024, "height": 768},
@@ -1281,11 +1536,19 @@ class BrowserManager:
                     ignore_default_args=["--enable-automation"],
                 )
 
+                if seed_cookies:
+                    try:
+                        raw = self._parse_cookies_payload(profile.get("google_cookies") or "[]")
+                        scoped = [c for c in raw if c.get("domain", "").lstrip(".") in {"google.com", "accounts.google.com", "flow.google.com", "www.google.com"} and not c.get("partitionKey")]
+                        await context.add_cookies(self._to_playwright_cookies(scoped))
+                    except (ValueError, TypeError):
+                        logger.warning("Stored cookies lack domain metadata; browser login is required")
                 token = await self._extract_from_context(profile, context)
                 return token
 
             except Exception as e:
-                logger.error(f"[{profile['name']}] 提取失败: {e}")
+                self._session_errors[profile_id] = failure("extraction_failed", "源浏览器启动或代理连接失败，请检查 Profile 配置")
+                logger.error(f"[{profile['name']}] 提取失败 ({type(e).__name__})")
                 return None
             finally:
                 if context:
@@ -1298,6 +1561,7 @@ class BrowserManager:
     async def _extract_from_context(self, profile: Dict[str, Any], context: BrowserContext) -> Optional[str]:
         """从上下文提取 Token（通过 signin 页面刷新 session）"""
         page = None
+        self._session_errors.pop(profile["id"], None)
         try:
             page = await context.new_page()
             await self._install_page_route(page)
@@ -1306,24 +1570,16 @@ class BrowserManager:
             logger.info(f"[{profile['name']}] 访问 {config.labs_url} 刷新 session...")
             await page.goto(config.labs_url, wait_until="domcontentloaded", timeout=60000)
 
-            token = await self._settle_labs_session(profile, context, page)
-            body_text = await self._safe_page_text(page)
-
-            await self._persist_login_state(
-                profile["id"],
-                token,
-                email=self._resolve_known_email(profile, body_text),
-            )
-            if token:
-                logger.info(f"[{profile['name']}] Token 提取成功")
-                await self._save_google_cookies_from_context(profile["id"], context)
-            else:
-                logger.warning(f"[{profile['name']}] 未找到 Token，会话可能已过期")
-
-            return token
+            await self._settle_labs_session(profile, context, page)
+            if self._session_errors.get(profile["id"], {}).get("error_code") == "manual_action_required":
+                await self._persist_login_state(profile["id"], None)
+                return None
+            return await self._complete_flow_session(profile, context, page)
 
         except Exception as e:
-            logger.error(f"[{profile['name']}] 提取异常: {e}")
+            self._session_errors[profile["id"]] = failure("extraction_failed", "源浏览器会话提取失败，请检查代理连接并完成 Labs/Flow 登录")
+            await self._persist_login_state(profile["id"], None)
+            logger.error(f"[{profile['name']}] 提取异常 ({type(e).__name__})")
             return None
         finally:
             if page:
@@ -1333,6 +1589,7 @@ class BrowserManager:
                     pass
 
     async def auto_login(self, profile_id: int) -> Dict[str, Any]:
+        self._session_errors.pop(profile_id, None)
         profile = await profile_db.get_profile(profile_id)
         if not profile:
             return {"success": False, "error": "Profile 不存在"}
@@ -1360,7 +1617,7 @@ class BrowserManager:
                 if config.enable_vnc:
                     use_vnc = await self._ensure_vnc_stack()
 
-                context = await self._playwright.chromium.launch_persistent_context(
+                context = await self._launch_persistent_context(
                     user_data_dir=profile_dir,
                     headless=not use_vnc,
                     viewport={"width": 1280, "height": 900},
@@ -1408,17 +1665,9 @@ class BrowserManager:
 
                     await asyncio.sleep(1.0)
 
-                token = await self._settle_labs_session(profile, context, page)
-                body_text = await self._safe_page_text(page)
-                await self._persist_login_state(
-                    profile_id,
-                    token,
-                    email=self._resolve_known_email(profile, body_text),
-                )
+                token = await self._complete_flow_session(profile, context, page)
                 if not token:
-                    return {"success": False, "error": "未获取到会话令牌，请改用手动登录"}
-
-                await self._save_google_cookies_from_context(profile_id, context)
+                    return self.get_session_error(profile_id)
 
                 return {
                     "success": True,
@@ -1428,8 +1677,9 @@ class BrowserManager:
                 }
 
             except Exception as e:
-                logger.error(f"[{profile['name']}] 自动登录失败: {e}")
-                return {"success": False, "error": str(e)}
+                await self._persist_login_state(profile_id, None)
+                logger.error(f"[{profile['name']}] 自动登录失败 ({type(e).__name__})")
+                return failure("extraction_failed", "源浏览器自动登录失败，请检查代理或通过手动登录完成授权")
             finally:
                 if page:
                     try:
@@ -1451,6 +1701,7 @@ class BrowserManager:
             return {"success": False, "error": "Profile 不存在"}
 
         token = await self.peek_token(profile_id)
+        project_id = await self.get_flow_project_id(profile_id)
         await self._persist_login_state(
             profile_id,
             token,
@@ -1459,11 +1710,29 @@ class BrowserManager:
         return {
             "success": True,
             "is_logged_in": token is not None,
-            "profile_name": profile["name"]
+            "has_flow_project": bool(project_id),
+            "profile_name": profile["name"],
+            **({"error": self.get_session_error(profile_id)["error"]} if not token else {}),
         }
 
+    async def _peek_context_session(self, profile, context) -> Optional[str]:
+        result = await self._validate_context_session(context, self._resolve_known_email(profile) or "")
+        if result["success"]:
+            try:
+                cookies = scoped_google_cookies(await context.cookies())
+                checked = validate_google_cookies(cookies)
+            except Exception:
+                checked = failure("verification_unavailable", "暂无法读取源浏览器 Cookie，请稍后重试")
+            if not checked["success"]:
+                result = checked
+        if not result["success"]:
+            self._session_errors[profile["id"]] = result
+            return None
+        self._session_errors.pop(profile["id"], None)
+        return result["session_token"]
+
     async def peek_token(self, profile_id: int) -> Optional[str]:
-        """轻量获取 token（不访问页面，仅读取 cookie）"""
+        """Verify existing OAuth without triggering a sign-in or changing browser pages."""
         async with self._lock:
             profile = await profile_db.get_profile(profile_id)
             if not profile:
@@ -1474,7 +1743,7 @@ class BrowserManager:
                 return None
 
             if self._active_profile_id == profile_id and self._active_context:
-                return await self._get_session_cookie(self._active_context)
+                return await self._peek_context_session(profile, self._active_context)
 
             context = None
             try:
@@ -1483,7 +1752,7 @@ class BrowserManager:
 
                 self._clean_locks(profile_dir)
                 proxy = await self._get_proxy(profile)
-                context = await self._playwright.chromium.launch_persistent_context(
+                context = await self._launch_persistent_context(
                     user_data_dir=profile_dir,
                     headless=True,
                     viewport={"width": 1024, "height": 768},
@@ -1493,7 +1762,7 @@ class BrowserManager:
                     args=BROWSER_ARGS,
                     ignore_default_args=["--enable-automation"],
                 )
-                return await self._get_session_cookie(context)
+                return await self._peek_context_session(profile, context)
             except Exception:
                 return None
             finally:
