@@ -285,57 +285,10 @@ function disconnectDashboardStream(resetStatus = true) {
 }
 
 function connectDashboardStream() {
-    if (!state.dashboard?.realtime?.sse_supported) {
-        setStreamStatus("offline");
-        return;
-    }
-
+    // Native EventSource cannot send the administrator Bearer header. Use the
+    // existing polling path; never place an administrator session in a URL.
     disconnectDashboardStream(false);
-    setStreamStatus("connecting");
-
-    const sessionToken = state.token || "";
-    const streamUrl = `${API}/api/dashboard/stream?session_token=${encodeURIComponent(sessionToken)}`;
-    const stream = new EventSource(streamUrl);
-    state.stream = stream;
-
-    const touch = () => {
-        state.streamLastEventAt = Date.now();
-    };
-
-    stream.addEventListener("ready", () => {
-        touch();
-        setStreamStatus("live");
-    });
-
-    stream.addEventListener("heartbeat", () => {
-        touch();
-        if (state.streamStatus !== "live") {
-            setStreamStatus("live");
-        }
-    });
-
-    stream.addEventListener("dashboard", () => {
-        touch();
-        setStreamStatus("live");
-        scheduleRealtimeRefresh();
-    });
-
-    stream.onerror = () => {
-        if (state.stream !== stream) {
-            return;
-        }
-        stream.close();
-        state.stream = null;
-        setStreamStatus("reconnecting");
-        if (state.scheduledStreamReconnect) {
-            window.clearTimeout(state.scheduledStreamReconnect);
-        }
-        const delayMs = Math.min(20000, 1500 * (2 ** Math.min(4, (state.streamLastEventAt ? 1 : 0) + 1)));
-        state.scheduledStreamReconnect = window.setTimeout(() => {
-            state.scheduledStreamReconnect = null;
-            connectDashboardStream();
-        }, delayMs);
-    };
+    setStreamStatus("offline");
 }
 
 function scheduleRealtimeRefresh() {
@@ -786,6 +739,7 @@ function renderApp() {
                 </div>
                 <div class="toolbar">
                     <span id="stream-status-pill" class="tag ${streamMeta.tone}">${escapeHtml(streamMeta.label)}</span>
+                    <button class="btn primary" onclick="location.href='/account-import'">${renderIcon("users")} 并发导入账号</button>
                     ${vncEnabled ? `<button class="btn outline" onclick="openVnc()" ${vncRunning ? "" : "disabled"}>${renderIcon("monitor")} ${vncRunning ? "远程登录" : "远程未启动"}</button>` : ""}
                     <button class="btn ghost icon-only" onclick="refreshDashboardAction(this)" title="刷新">${renderIcon("refresh")}</button>
                     <button class="btn ghost icon-only danger-text" onclick="doLogout(this)" title="退出">${renderIcon("logout")}</button>
@@ -1812,4 +1766,3 @@ window.launchBrowser = launchBrowser;
 window.closeBrowser = closeBrowser;
 window.deleteProfile = deleteProfile;
 window.openVnc = openVnc;
-

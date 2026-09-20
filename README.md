@@ -5,6 +5,9 @@ Flow2API Token Updater 是一个轻量级的多账号令牌刷新工具。
 迁移到 `flow.google.com` 后默认使用浏览器刷新，取得完整 Google/Flow Cookie 与兼容 REST 的 Labs session。
 旧的纯协议刷新仅在 `FLOW_PROTOCOL_REFRESH_ENABLED=true` 时启用，不代表已建立新站会话。
 
+> 授权提示：上游仓库当前未声明开源许可证。本 fork 的功能分支用于协作审查；
+> 在向他人提供衍生源码或发布容器镜像前，请先向上游确认授权范围。
+
 当前版本重点解决三件事：
 
 - 多账号管理
@@ -23,7 +26,13 @@ Flow2API Token Updater 是一个轻量级的多账号令牌刷新工具。
 - 智能同步：按最终生效的 Flow2API 地址和令牌分组
 - 单账号覆盖：每个 Profile 都可以覆盖目标地址和连接令牌
 - 代理支持：每个 Profile 都可以使用独立代理
-- 实时仪表盘：优先使用 SSE，失败时自动回退到轮询
+- **两个独立人工登录槽位**：固定两套 Chromium/Xvfb/noVNC，可让两名 owner
+  同时完成不同新 Profile 的可见登录；同步与账号验收仍严格串行
+
+并发登录的操作与安全边界见
+[Two concurrent owner-login slots](docs/two-login-slots.md)。管理员登录后可从
+控制台进入 `/account-import`。邀请页面不提供同步、Cookie 导出或账号启用能力。
+- 仪表盘定时轮询：避免将管理员会话放入 SSE URL 和访问日志
 - 图表范围切换：6 小时 / 24 小时 / 72 小时 / 7 天
 - 内置分析：同步活动、失败原因、目标实例分布
 
@@ -64,7 +73,7 @@ Flow2API Token Updater 是一个轻量级的多账号令牌刷新工具。
 ### 1. 克隆并配置
 
 ```bash
-git clone https://github.com/genz27/flow2api_tupdater.git
+git clone --branch feat/two-login-slots https://github.com/grey0758/flow2api_tupdater.git
 cd flow2api_tupdater
 cp .env.example .env
 ```
@@ -72,6 +81,7 @@ cp .env.example .env
 至少需要在 `.env` 中设置以下变量：
 
 - `ADMIN_PASSWORD`
+- `VNC_PASSWORD`（使用与管理员密码不同的独立随机值）
 - `FLOW2API_URL`
 - `CONNECTION_TOKEN`
 
@@ -164,7 +174,7 @@ docker compose up -d --build
 | `CONFIG_FILE` | 持久化全局配置文件路径 | `/app/data/config.json` |
 | `API_PORT` | HTTP 监听端口 | `8002` |
 | `ENABLE_VNC` | 是否启用 VNC 登录入口，`1/0` | `1` |
-| `VNC_PASSWORD` | noVNC / x11vnc 密码 | `flow2api` |
+| `VNC_PASSWORD` | noVNC / x11vnc 独立随机密码 | 必填，无默认值 |
 
 ### 配置优先级
 
@@ -189,7 +199,7 @@ docker compose up -d --build
 - `GET /api/auth/check`
 - `GET /api/status`
 - `GET /api/dashboard?hours=6|24|72|168`
-- `GET /api/dashboard/stream?session_token=...`
+- `GET /api/dashboard/stream`（仅接受 `Authorization: Bearer ...`；浏览器界面默认轮询，避免令牌进入 URL）
 - `GET /api/config`
 - `POST /api/config`
 - `GET /api/profiles`
@@ -303,4 +313,6 @@ v3.3 新增了以下能力：
 
 ## 许可证
 
-MIT
+上游仓库当前没有可核验的许可证文件或 GitHub 许可证声明。本 fork 不新增或推定
+授权；向他人提供衍生源码、合并到默认分支或发布容器镜像前，应先取得上游授权并确认
+所需的许可证与 NOTICE 文本。

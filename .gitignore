@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 
 .env
+.env.*
+!.env.example
 .admin-password
 .vnc-password
 .venv/
@@ -10,6 +12,7 @@ venv/
 data/
 profiles/
 logs/
+backups/
 
 dist/
 build/

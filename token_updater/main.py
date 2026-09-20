@@ -76,6 +76,8 @@ async def shutdown():
     logger.info("正在关闭...")
     if scheduler.running:
         scheduler.shutdown()
+    from .login_slots import login_slots
+    await login_slots.stop()
     await browser_manager.stop()
 
 

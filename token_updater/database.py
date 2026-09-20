@@ -39,7 +39,12 @@ class ProfileDB:
                     proxy_url TEXT,
                     proxy_enabled INTEGER DEFAULT 0,
                     flow2api_url TEXT,
-                    connection_token_override TEXT
+                    connection_token_override TEXT,
+                    login_slot_prepared INTEGER DEFAULT 0,
+                    login_slot_claimed INTEGER DEFAULT 0,
+                    observed_flow_project_id TEXT,
+                    observed_flow_project_verified INTEGER DEFAULT 0,
+                    observed_flow_project_identity TEXT
                 )
             """)
             
@@ -69,6 +74,16 @@ class ProfileDB:
                 await db.execute("ALTER TABLE profiles ADD COLUMN last_check_result TEXT")
             if 'login_method' not in columns:
                 await db.execute("ALTER TABLE profiles ADD COLUMN login_method TEXT")
+            if 'login_slot_prepared' not in columns:
+                await db.execute("ALTER TABLE profiles ADD COLUMN login_slot_prepared INTEGER DEFAULT 0")
+            if 'login_slot_claimed' not in columns:
+                await db.execute("ALTER TABLE profiles ADD COLUMN login_slot_claimed INTEGER DEFAULT 0")
+            if 'observed_flow_project_id' not in columns:
+                await db.execute("ALTER TABLE profiles ADD COLUMN observed_flow_project_id TEXT")
+            if 'observed_flow_project_verified' not in columns:
+                await db.execute("ALTER TABLE profiles ADD COLUMN observed_flow_project_verified INTEGER DEFAULT 0")
+            if 'observed_flow_project_identity' not in columns:
+                await db.execute("ALTER TABLE profiles ADD COLUMN observed_flow_project_identity TEXT")
 
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS sync_history (
@@ -102,6 +117,8 @@ class ProfileDB:
         flow2api_url: str = "",
         connection_token_override: str = "",
         captcha_proxy_url: str = "",
+        is_active: bool = True,
+        login_slot_prepared: bool = False,
     ) -> int:
         """添加 profile"""
         async with aiosqlite.connect(self.db_path) as db:
@@ -116,8 +133,9 @@ class ProfileDB:
                     proxy_enabled,
                     flow2api_url,
                     connection_token_override,
-                    created_at, captcha_proxy_url
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, captcha_proxy_url, is_active,
+                    login_slot_prepared
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
@@ -130,6 +148,8 @@ class ProfileDB:
                     connection_token_override,
                     datetime.now().isoformat(),
                     captcha_proxy_url,
+                    int(is_active),
+                    int(login_slot_prepared),
                 )
             )
             await db.commit()
@@ -158,6 +178,43 @@ class ProfileDB:
             cursor = await db.execute("SELECT * FROM profiles WHERE name = ?", (name,))
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    async def claim_login_slot(self, profile_id: int) -> bool:
+        """Persist single-use invitation ownership before returning any link."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """UPDATE profiles
+                   SET login_slot_claimed = 1, login_slot_prepared = 0
+                   WHERE id = ?
+                   AND COALESCE(login_slot_prepared, 0) = 1
+                   AND COALESCE(login_slot_claimed, 0) = 0
+                   AND COALESCE(is_active, 0) = 0
+                   AND COALESCE(is_logged_in, 0) = 0
+                   AND COALESCE(sync_count, 0) = 0
+                   AND COALESCE(error_count, 0) = 0
+                   AND COALESCE(email, '') = ''
+                   AND COALESCE(last_token, '') = ''
+                   AND COALESCE(last_token_time, '') = ''
+                   AND COALESCE(last_check_time, '') = ''
+                   AND COALESCE(last_check_result, '') = ''
+                   AND COALESCE(last_sync_time, '') = ''
+                   AND COALESCE(last_sync_result, '') = ''
+                   AND COALESCE(login_account, '') = ''
+                   AND COALESCE(login_password, '') = ''
+                   AND COALESCE(login_method, '') = ''
+                   AND COALESCE(google_cookies, '') = ''
+                   AND COALESCE(observed_flow_project_id, '') = ''
+                   AND COALESCE(observed_flow_project_verified, 0) = 0
+                   AND COALESCE(observed_flow_project_identity, '') = ''
+                   AND COALESCE(flow2api_url, '') = ''
+                   AND COALESCE(connection_token_override, '') = ''
+                   AND COALESCE(proxy_enabled, 0) = 1
+                   AND COALESCE(proxy_url, '') != ''
+                   AND COALESCE(captcha_proxy_url, '') != ''""",
+                (profile_id,),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
     
     async def update_profile(self, profile_id: int, **kwargs):
         """更新 profile"""

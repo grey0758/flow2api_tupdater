@@ -162,11 +162,13 @@ class BrowserManager:
     async def _discover_flow_project_id(
         self,
         profile_id: int,
-        context: BrowserContext,
+        context: Optional[BrowserContext],
     ) -> Optional[str]:
         remembered = self._remember_flow_project_id(profile_id, context)
         if remembered:
             return remembered
+        if context is None:
+            return None
         for page in list(context.pages or []):
             try:
                 host = str(urlparse(str(page.url or "")).hostname or "").lower()
@@ -191,7 +193,83 @@ class BrowserManager:
                 return await self._discover_flow_project_id(
                     profile_id, self._active_context
                 )
-            return self._flow_project_ids.get(int(profile_id))
+            remembered = self._flow_project_ids.get(int(profile_id))
+            if remembered:
+                return remembered
+            profile = await profile_db.get_profile(profile_id)
+            if not profile or not profile.get("observed_flow_project_verified"):
+                return None
+            project_identity = self._normalize_email(
+                profile.get("observed_flow_project_identity") or ""
+            )
+            profile_identity = self._normalize_email(profile.get("email") or "")
+            if not project_identity or project_identity != profile_identity:
+                return None
+            return self._normalize_flow_project_id(
+                profile.get("observed_flow_project_id")
+            )
+
+    async def check_login_slot_status(
+        self, profile_id: int, context: BrowserContext
+    ) -> Dict[str, Any]:
+        """Validate Labs/credits/Cookies, then bind a project in that exact context."""
+        async with self._lock:
+            profile = await profile_db.get_profile(profile_id)
+            if not profile or context is None:
+                return {"success": False, "error": "登录槽位浏览器不存在"}
+            result = await self._validate_context_session(
+                context, self._resolve_known_email(profile) or ""
+            )
+            if result.get("success"):
+                try:
+                    checked = validate_google_cookies(
+                        scoped_google_cookies(await context.cookies())
+                    )
+                except Exception:
+                    checked = failure(
+                        "verification_unavailable", "暂无法读取源浏览器 Cookie，请稍后重试"
+                    )
+                if not checked.get("success"):
+                    result = checked
+            if not result.get("success"):
+                self._session_errors[profile_id] = result
+                await self._persist_login_state(profile_id, None)
+                return {
+                    "success": True,
+                    "is_logged_in": False,
+                    "has_flow_project": False,
+                    "profile_name": profile["name"],
+                    "error_code": result.get("error_code", "auth_required"),
+                    "error": result.get("error", "请继续完成 Google、Flow 与 Labs 授权"),
+                }
+
+            identity = self._normalize_email(result.get("email") or "")
+            project_id = await self._discover_flow_project_id(profile_id, context)
+            await self._persist_login_state(
+                profile_id, result["session_token"], email=identity
+            )
+            if project_id and identity:
+                await profile_db.update_profile(
+                    profile_id,
+                    observed_flow_project_id=project_id,
+                    observed_flow_project_verified=1,
+                    observed_flow_project_identity=identity,
+                )
+            self._session_errors.pop(profile_id, None)
+            return {
+                "success": True,
+                "is_logged_in": True,
+                "has_flow_project": bool(project_id and identity),
+                "profile_name": profile["name"],
+                **(
+                    {}
+                    if project_id and identity
+                    else {
+                        "error_code": "project_required",
+                        "error": "Labs 已验证，但尚未在同一登录 Profile 中观察到 Flow 项目",
+                    }
+                ),
+            }
 
     async def _launch_persistent_context(self, **kwargs):
         configure_web_only_profile(kwargs["user_data_dir"])
@@ -1129,7 +1207,7 @@ class BrowserManager:
             elif not await self._save_google_cookies_from_context(profile["id"], context):
                 result = failure("cookies_incomplete", "Flow/Google 登录 Cookie 不完整，请在源 Profile 完成 Flow 登录")
             else:
-                self._remember_flow_project_id(profile["id"], context, page)
+                await self._discover_flow_project_id(profile["id"], context)
         if not result["success"]:
             self._session_errors[profile["id"]] = result
             await self._persist_login_state(profile["id"], None)
@@ -1143,6 +1221,15 @@ class BrowserManager:
                 await self._persist_login_state(profile["id"], None)
                 return None
             token = checked["session_token"]
+        project_id = self._flow_project_ids.get(int(profile["id"]))
+        identity = self._normalize_email(result.get("email") or "")
+        if project_id and identity:
+            await profile_db.update_profile(
+                profile["id"],
+                observed_flow_project_id=project_id,
+                observed_flow_project_verified=1,
+                observed_flow_project_identity=identity,
+            )
         await self._persist_login_state(profile["id"], token, email=result["email"])
         self._session_errors.pop(profile["id"], None)
         return token
@@ -1158,6 +1245,12 @@ class BrowserManager:
         if not logged_in:
             self._flow_project_ids.pop(int(profile_id), None)
         update_data: Dict[str, Any] = {"is_logged_in": 1 if logged_in else 0}
+        if not logged_in:
+            update_data.update(
+                observed_flow_project_id=None,
+                observed_flow_project_verified=0,
+                observed_flow_project_identity=None,
+            )
         if token:
             update_data["last_token"] = self._mask_token(token)
             update_data["last_token_time"] = datetime.now().isoformat()

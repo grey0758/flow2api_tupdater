@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>独立 Flow 登录槽位</title>
+  <style>
+    body { font: 16px system-ui; margin: 0; background: #101827; color: #fff; }
+    header { padding: 12px 18px; line-height: 1.5; }
+    button { padding: 10px 16px; cursor: pointer; margin-left: 8px; }
+    iframe { border: 0; width: 100vw; height: calc(100vh - 100px); }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong id="title">正在验证短期邀请…</strong>
+    <span id="instructions" class="hidden">只在下方专属浏览器登录 Google、Flow 和 Labs；不要导出 Cookie。
+      <button id="done">我已完成登录</button>
+    </span>
+    <span id="status"></span>
+  </header>
+  <iframe id="vnc" class="hidden" title="专属 VNC"></iframe>
+  <script src="/static/login-slot.js"></script>
+</body>
+</html>

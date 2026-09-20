@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Flow 新账号导入</title>
+  <link rel="stylesheet" href="/static/account-import.css">
+</head>
+<body>
+  <main>
+    <header>
+      <a href="/">← 返回控制台</a>
+      <p class="eyebrow">仅限管理员准备账号</p>
+      <h1>两人并发登录，验收仍然串行</h1>
+      <p>每位同事会得到独立 Chromium、Xvfb 和 noVNC。这里不接收 Google 密码、MFA、Cookie 或 Token。</p>
+    </header>
+
+    <section class="warning">
+      <strong>登录完成 ≠ 可调用。</strong>
+      后续仍由管理员依次执行 check-login、extract、身份去重、备份、一次 sync，以及独立图片验收。
+    </section>
+
+    <section class="card">
+      <h2>1. 准备一个全新 Profile</h2>
+      <form id="prepare">
+        <label>Profile 名称 <input id="name" required maxlength="64" placeholder="例如 schedulable-next-modern"></label>
+        <label>源浏览器代理 <input id="source-proxy" required placeholder="http://host:port"></label>
+        <label>目标 CAPTCHA 代理 <input id="captcha-proxy" required placeholder="http://host:port"></label>
+        <button>创建为 inactive</button>
+      </form>
+      <p id="prepare-result" class="status"></p>
+    </section>
+
+    <section class="card">
+      <div class="row"><div><h2>2. 申请独立登录槽位</h2>
+      <p>只选择由上一步准备、未经修改、inactive、sync_count=0 且没有 Cookie/凭据的 Profile。</p></div>
+      <button id="refresh" class="secondary">刷新</button></div>
+      <div id="slots" class="slots"></div>
+      <label>待登录 Profile <select id="profile"></select></label>
+      <button id="start">启动槽位并生成邀请链接</button>
+      <div id="invite" class="invite hidden">
+        <p>将此短期链接只发给对应同事；每人打开自己的链接。</p>
+        <input id="invite-url" readonly>
+        <button id="copy" class="secondary">复制邀请链接</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>3. 同事完成可见登录</h2>
+      <ol>
+        <li>在专属页面中登录 Google 与现代 Flow。</li>
+        <li>如页面要求，再完成 Labs OAuth 与 Google 同意。</li>
+        <li>不要导出 Cookie、浏览器数据或 Token。</li>
+        <li>点击“我已完成登录”并保持页面打开；管理员检查通过后槽位才会释放，缺少授权时仍在同一桌面补齐。</li>
+      </ol>
+    </section>
+    <div id="toast" role="status"></div>
+  </main>
+  <script src="/static/account-import.js"></script>
+</body>
+</html>

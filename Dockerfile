@@ -1,11 +1,10 @@
 ﻿# Flow2API Token Updater v3.1
 # 持久化浏览器上下文 + VNC 登录 + Headless 刷新
 
-FROM python:3.11-slim-bookworm
+FROM python:3.11-slim-bookworm@sha256:a36c24f9cbdf4fd0f52d67f0823eeac19c2028c637cecc392d97f980d4fec56b
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DISPLAY=:99
-ENV VNC_PASSWORD=flow2api
 ENV NOVNC_PORT=6080
 ENV RESOLUTION=1024x768x16
 ENV ENABLE_VNC=1
@@ -13,7 +12,8 @@ ENV ENABLE_VNC=1
 WORKDIR /app
 
 # 安装系统依赖
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's#http://deb.debian.org/#https://deb.debian.org/#g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     # VNC
     x11vnc \
     xvfb \
@@ -61,7 +61,7 @@ COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 # 目录
 RUN mkdir -p /app/profiles /app/logs /app/data
 
-EXPOSE 6080 8002
+EXPOSE 6080 6081 6082 8002
 
 VOLUME ["/app/profiles", "/app/logs", "/app/data"]
 

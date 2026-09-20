@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+      - "feat/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run repository checks
+        run: bash scripts/ci.sh
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build image
+        run: docker build --tag flow2api-token-updater:ci .
+      - name: Exercise two real login desktops
+        run: |
+          set -euo pipefail
+          name=flow2api-login-slot-smoke
+          cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run -d --name "$name" \
+            -e ADMIN_PASSWORD=ci-admin-only \
+            -e VNC_PASSWORD=ci-vnc-only \
+            -v "$GITHUB_WORKSPACE/scripts/smoke_login_slots.py:/tmp/smoke_login_slots.py:ro" \
+            flow2api-token-updater:ci
+          for attempt in $(seq 1 30); do
+            if docker exec "$name" supervisorctl -c /etc/supervisor/conf.d/supervisord.conf status token_updater \
+              | grep -q RUNNING; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec -e PYTHONPATH=/app "$name" python /tmp/smoke_login_slots.py
+          test "$(docker inspect -f '{{.RestartCount}}' "$name")" -eq 0
+          test "$(docker inspect -f '{{.State.OOMKilled}}' "$name")" = false
+          docker stats --no-stream --format '{{.MemUsage}}' "$name"

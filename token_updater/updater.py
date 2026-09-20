@@ -257,6 +257,9 @@ class TokenSyncer:
             return failure("destination_unavailable", "目标状态查询失败，请检查服务地址、网络连接或稍后重试")
 
     async def sync_profile(self, profile_id: int, *, source: str = "manual") -> Dict[str, Any]:
+        from .login_slots import login_slots
+        if login_slots.owns(profile_id):
+            return {"success": False, "error": "Profile 正在独立登录槽位中，禁止同步"}
         profile = await profile_db.get_profile(profile_id)
         profile_name = profile.get("name", "") if profile else ""
         async with self._sync_lock:
@@ -270,6 +273,9 @@ class TokenSyncer:
 
     async def _sync_profile(self, profile_id: int) -> Dict[str, Any]:
         """同步单个 Profile。"""
+        from .login_slots import login_slots
+        if login_slots.owns(profile_id):
+            return {"success": False, "error": "Profile 正在独立登录槽位中，禁止同步"}
         profile = await profile_db.get_profile(profile_id)
         if not profile:
             return {"success": False, "error": "Profile 不存在"}
@@ -375,7 +381,22 @@ class TokenSyncer:
             if not checked["success"]:
                 return checked
             options["google_cookies"] = cookies
-            project_id = await browser_manager.get_flow_project_id(profile_id)
+            project_identity = browser_manager._normalize_email(
+                fresh_profile.get("observed_flow_project_identity") or ""
+            )
+            current_identity = browser_manager._normalize_email(
+                fresh_profile.get("email") or ""
+            )
+            stored_project = None
+            if (
+                fresh_profile.get("observed_flow_project_verified")
+                and project_identity
+                and project_identity == current_identity
+            ):
+                stored_project = browser_manager._normalize_flow_project_id(
+                    fresh_profile.get("observed_flow_project_id")
+                )
+            project_id = stored_project or await browser_manager.get_flow_project_id(profile_id)
             if project_id:
                 options["project_id"] = project_id
             # Source localhost and destination localhost can be different machines.
@@ -467,6 +488,12 @@ class TokenSyncer:
 
                 self._last_batch_time = datetime.now()
                 profiles = await profile_db.get_active_profiles()
+                from .login_slots import login_slots
+                profiles = [
+                    profile for profile in profiles
+                    if not login_slots.owns(profile["id"])
+                    and not (profile.get("login_slot_claimed") and not profile.get("sync_count"))
+                ]
 
                 if not profiles:
                     result = {"success": True, "total": 0, "synced": 0, "skipped": 0, "results": []}
@@ -616,6 +643,12 @@ class TokenSyncer:
     async def _sync_all_profiles_force(self) -> Dict[str, Any]:
         """强制同步所有 Profile（不检查过期状态）。"""
         profiles = await profile_db.get_active_profiles()
+        from .login_slots import login_slots
+        profiles = [
+            profile for profile in profiles
+            if not login_slots.owns(profile["id"])
+            and not (profile.get("login_slot_claimed") and not profile.get("sync_count"))
+        ]
         group_result = await self._sync_profiles_force(profiles)
 
         logger.info(

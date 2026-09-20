@@ -18,7 +18,7 @@ class FlowSessionSyncTests(unittest.IsolatedAsyncioTestCase):
                    "proxy_enabled":1, "proxy_url":"socks5://127.0.0.1:20001", "google_cookies":"SID=old"}
         fresh = {**profile, "google_cookies":json.dumps(JAR)}
         with patch.object(config, "protocol_refresh_enabled", False), \
-             patch("token_updater.updater.profile_db.get_profile", AsyncMock(side_effect=[profile, fresh])), \
+             patch("token_updater.updater.profile_db.get_profile", AsyncMock(side_effect=[profile, fresh, fresh])), \
              patch("token_updater.updater.profile_db.update_profile", AsyncMock()), \
              patch("token_updater.updater.profile_db.record_sync_event", AsyncMock()), \
              patch("token_updater.updater.dashboard_events.publish", AsyncMock()), \

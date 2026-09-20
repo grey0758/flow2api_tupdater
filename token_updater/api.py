@@ -1,17 +1,21 @@
 """Token Updater API v3.3"""
 import secrets
 import time
+import asyncio
+import os
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 from apscheduler.triggers.interval import IntervalTrigger
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+import websockets
 
 from .browser import browser_manager
 from .config import config
@@ -19,11 +23,12 @@ from .database import profile_db
 from .events import dashboard_events
 from .execution import execution_gate
 from .logger import logger
+from .login_slots import LoginSlotError, login_slots
 from .proxy_utils import validate_proxy_format
 from .updater import token_syncer
 
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.4.1"
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 DASHBOARD_HOURS_OPTIONS = (6, 24, 72, 168)
@@ -50,6 +55,90 @@ MAX_CONNECTION_TOKEN_LEN = 2048
 MAX_LOGIN_ACCOUNT_LEN = 320
 MAX_LOGIN_PASSWORD_LEN = 512
 MAX_IMPORT_CONTENT_LEN = 100_000
+_prepare_lock = asyncio.Lock()
+
+
+class PrepareLoginProfile(BaseModel):
+    name: str
+    source_proxy_url: str
+    captcha_proxy_url: str
+
+
+class ClaimLoginSlot(BaseModel):
+    capability: str
+
+
+def _require_profile_not_onboarding(profile_id: int) -> None:
+    if login_slots.owns(profile_id):
+        raise HTTPException(409, "该 Profile 正在独立登录槽位中；先完成登录并释放浏览器")
+
+
+def _require_no_onboarding_slots() -> None:
+    if login_slots.any_active():
+        raise HTTPException(409, "并发登录仍在进行；请等待两个 owner 槽位释放后再做串行验收")
+
+
+def _is_fresh_login_slot_profile(profile: Dict[str, Any]) -> bool:
+    """Only /prepare-created, untouched Profiles may enter an owner slot."""
+    empty_fields = (
+        "email", "last_token", "last_token_time", "last_check_time",
+        "last_check_result", "last_sync_time", "last_sync_result",
+        "login_account", "login_password", "login_method", "google_cookies",
+        "observed_flow_project_id", "observed_flow_project_identity",
+        "flow2api_url", "connection_token_override",
+    )
+    return bool(profile.get("login_slot_prepared")) and not any(
+        (
+            profile.get("is_active"),
+            profile.get("is_logged_in"),
+            profile.get("sync_count"),
+            profile.get("error_count"),
+            profile.get("login_slot_claimed"),
+            profile.get("observed_flow_project_verified"),
+            *(profile.get(field) for field in empty_fields),
+        )
+    )
+
+
+def _slot_or_http_error(capability: str):
+    if not capability:
+        raise HTTPException(401, "邀请会话不存在")
+    try:
+        return login_slots.authorize(capability)
+    except LoginSlotError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
+
+def _slot_from_request(request: Request):
+    return _slot_or_http_error(request.cookies.get("flow_login_slot", ""))
+
+
+def _require_same_origin(request: Request) -> None:
+    origin = request.headers.get("origin", "")
+    host = request.headers.get("host", "")
+    parsed = urlparse(origin)
+    if not origin or parsed.scheme != "https" or parsed.netloc != host:
+        raise HTTPException(403, "登录槽位要求同源 HTTPS 请求")
+
+
+def _backup_updater_before_profile_create() -> None:
+    """Online SQLite backup for the login-only prepare phase (no Flow write)."""
+    source = Path(config.db_path)
+    if not source.is_file():
+        raise RuntimeError("Updater SQLite database is not initialized")
+    backup_dir = source.parent / "onboarding-backups"
+    backup_dir.mkdir(mode=0o700, exist_ok=True)
+    backup_path = backup_dir / f"profiles-prelogin-{int(time.time())}-{secrets.token_hex(8)}.db"
+    fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    try:
+        with sqlite3.connect(str(source)) as origin, sqlite3.connect(str(backup_path)) as target:
+            origin.backup(target)
+            if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise RuntimeError("Updater SQLite backup failed integrity check")
+    except Exception:
+        backup_path.unlink(missing_ok=True)
+        raise
 
 
 def _session_ttl_seconds() -> int:
@@ -401,7 +490,12 @@ def _serialize_profile(
 ) -> Dict[str, Any]:
     data = dict(profile)
     data["has_google_cookies"] = bool(data.pop("google_cookies", None))
-    data["is_browser_active"] = data["id"] == active_id
+    data.pop("observed_flow_project_id", None)
+    data.pop("observed_flow_project_identity", None)
+    data.pop("observed_flow_project_verified", None)
+    data["login_slot_prepared"] = bool(data.get("login_slot_prepared"))
+    data["login_slot_claimed"] = bool(data.get("login_slot_claimed"))
+    data["is_browser_active"] = data["id"] == active_id or login_slots.owns(data["id"])
     data["effective_flow2api_url"] = (data.get("flow2api_url") or config.flow2api_url or "").rstrip("/")
     data["uses_default_target"] = not bool(data.get("flow2api_url"))
     data["has_connection_token_override"] = bool(data.get("connection_token_override"))
@@ -457,6 +551,7 @@ async def _build_dashboard_payload(hours: int = 24) -> Dict[str, Any]:
 
     return {
         "browser": browser_manager.get_status(),
+        "login_slots": login_slots.status(),
         "execution": execution_gate.get_status(),
         "syncer": token_syncer.get_status(),
         "config": _public_config(),
@@ -498,7 +593,9 @@ async def _build_dashboard_payload(hours: int = 24) -> Dict[str, Any]:
             "hour_options": list(DASHBOARD_HOURS_OPTIONS),
         },
         "realtime": {
-            "sse_supported": True,
+            # Native EventSource cannot attach the existing Bearer header.
+            # Keep polling rather than place an administrator session in a URL.
+            "sse_supported": False,
         },
         "server_time": datetime.now().isoformat(),
         "version": APP_VERSION,
@@ -694,11 +791,199 @@ async def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/account-import", response_class=HTMLResponse)
+async def account_import_page():
+    return FileResponse(STATIC_DIR / "account-import.html")
+
+
+@app.get("/api/login-slots")
+async def get_login_slots(token: str = Depends(verify_session)):
+    return {"slots": login_slots.status()}
+
+
+@app.post("/api/login-slots/prepare")
+async def prepare_login_profile(request: PrepareLoginProfile, token: str = Depends(verify_session)):
+    """Create an inactive, credential-empty source Profile; never launch or sync it."""
+    name = _validate_name(request.name)
+    source_proxy = _validate_proxy(request.source_proxy_url)
+    captcha_proxy = _validate_proxy(request.captcha_proxy_url)
+    if not source_proxy or not captcha_proxy:
+        raise HTTPException(400, "新账号需要明确的源代理及目标 CAPTCHA 代理")
+    async with _prepare_lock:
+        if await profile_db.get_profile_by_name(name):
+            raise HTTPException(409, "Profile 名称已存在")
+        try:
+            await asyncio.to_thread(_backup_updater_before_profile_create)
+        except Exception:
+            logger.exception("新 Profile 的 Updater SQLite 在线备份失败")
+            raise HTTPException(503, "写前在线备份失败，未创建 Profile")
+        profile_id = await profile_db.add_profile(
+            name=name, proxy_url=source_proxy,
+            captcha_proxy_url=captcha_proxy, is_active=False,
+            login_slot_prepared=True,
+        )
+    await dashboard_events.publish("profile_created", {"profile_id": profile_id})
+    return {"profile_id": profile_id, "is_active": False, "next": "启动独立登录槽位"}
+
+
+@app.post("/api/login-slots/{profile_id}/start")
+async def start_login_slot(profile_id: int, token: str = Depends(verify_session)):
+    profile = await profile_db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(404, "Profile 不存在")
+    if not _is_fresh_login_slot_profile(profile):
+        raise HTTPException(409, "只能给本页面刚准备、未登录且未修改的新 Profile 开启邀请")
+    if not profile.get("proxy_enabled") or not profile.get("captcha_proxy_url"):
+        raise HTTPException(400, "Profile 需要独立源代理和目标 CAPTCHA 代理")
+    profile_dir = Path(config.profiles_dir) / f"profile_{profile_id}"
+    if profile_dir.exists() and (not profile_dir.is_dir() or any(profile_dir.iterdir())):
+        raise HTTPException(409, "浏览器目录已有数据；不可将旧会话交给新邀请")
+    try:
+        slot = await login_slots.launch(profile)
+    except LoginSlotError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    except Exception:
+        logger.exception("登录槽位启动失败（不记录浏览器数据）")
+        raise HTTPException(503, "登录槽位启动失败，请管理员检查服务状态")
+    try:
+        if not await profile_db.claim_login_slot(profile_id):
+            raise HTTPException(409, "Profile 不再符合首次邀请条件")
+    except Exception:
+        await login_slots.release(slot.number, expected=slot)
+        raise
+    return {
+        "slot": slot.number, "profile_id": profile_id,
+        "invite_url": f"/login-slots#{slot.capability}",
+        "expires_at": slot.expires_at,
+    }
+
+
+@app.delete("/api/login-slots/{number}")
+async def cancel_login_slot(number: int, token: str = Depends(verify_session)):
+    slot = await login_slots.get_slot(number) if number in {1, 2} else None
+    if not slot:
+        raise HTTPException(404, "槽位不存在")
+    await login_slots.release(number, expected=slot)
+    return {"success": True}
+
+
+@app.get("/login-slots", response_class=HTMLResponse)
+async def owner_login_page():
+    return FileResponse(
+        STATIC_DIR / "login-slot.html",
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+
+@app.post("/login-slots/claim")
+async def claim_login_slot(request: ClaimLoginSlot, http_request: Request):
+    _require_same_origin(http_request)
+    try:
+        slot, session_capability = await login_slots.claim(request.capability)
+    except LoginSlotError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    response = JSONResponse({"slot": slot.number, "state": slot.state})
+    response.set_cookie(
+        "flow_login_slot", session_capability,
+        max_age=max(1, int(slot.expires_at - time.time())),
+        httponly=True, secure=True, samesite="strict", path="/login-slots",
+    )
+    return response
+
+
+@app.get("/login-slots/session")
+async def owner_login_session(request: Request):
+    slot = _slot_from_request(request)
+    return {"slot": slot.number, "state": slot.state}
+
+
+@app.post("/login-slots/complete")
+async def owner_complete_login(request: Request):
+    _require_same_origin(request)
+    slot = _slot_from_request(request)
+    profile_id = await login_slots.finish_owner_login(slot)
+    await dashboard_events.publish("owner_login_reported", {"profile_id": profile_id})
+    return JSONResponse({
+        "success": True, "profile_id": profile_id, "verified": False,
+        "message": "已暂停操作；浏览器保留，等待管理员无成本检查",
+    })
+
+
+@app.websocket("/login-slots/vnc/websockify")
+async def login_slot_websocket(websocket: WebSocket):
+    try:
+        _require_same_origin(websocket)
+    except HTTPException:
+        await websocket.close(code=1008)
+        return
+    try:
+        slot = login_slots.authorize(websocket.cookies.get("flow_login_slot", ""))
+    except (LoginSlotError, TypeError):
+        await websocket.close(code=1008)
+        return
+    try:
+        async with websockets.connect(
+            f"ws://127.0.0.1:{slot.novnc_port}/websockify",
+            max_size=8 * 1024 * 1024,
+            subprotocols=["binary"],
+        ) as backend:
+            requested = websocket.headers.get("sec-websocket-protocol", "")
+            await websocket.accept(subprotocol="binary" if "binary" in requested else None)
+            async def to_backend():
+                while True:
+                    message = await websocket.receive()
+                    if message["type"] == "websocket.disconnect":
+                        break
+                    if message.get("bytes") is not None:
+                        await backend.send(message["bytes"])
+                    elif message.get("text") is not None:
+                        await backend.send(message["text"])
+
+            async def to_client():
+                async for message in backend:
+                    if isinstance(message, bytes):
+                        await websocket.send_bytes(message)
+                    else:
+                        await websocket.send_text(message)
+
+            pending = [
+                asyncio.create_task(to_backend()),
+                asyncio.create_task(to_client()),
+                asyncio.create_task(slot.closed.wait()),
+            ]
+            done, remaining = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in remaining:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+    except (OSError, WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
+        pass
+    finally:
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass
+
+
+@app.get("/login-slots/vnc/{asset:path}")
+async def login_slot_asset(request: Request, asset: str):
+    _slot_from_request(request)
+    parts = Path(asset).parts
+    if not parts or (parts[0] not in {"app", "core", "vendor", "vnc.html", "favicon.ico"}
+                     or (parts[0] == "vnc.html" and len(parts) != 1)):
+        raise HTTPException(404, "文件不存在")
+    root = Path("/usr/share/novnc").resolve()
+    path = (root / asset).resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise HTTPException(404, "文件不存在")
+    return FileResponse(path, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
 @app.get("/api/status")
 async def get_status(token: str = Depends(verify_session)):
     profiles = await profile_db.get_all_profiles()
     return {
         "browser": browser_manager.get_status(),
+        "login_slots": login_slots.status(),
         "execution": execution_gate.get_status(),
         "syncer": token_syncer.get_status(),
         "profiles": {
@@ -720,8 +1005,7 @@ async def get_dashboard(
 
 
 @app.get("/api/dashboard/stream")
-async def stream_dashboard(session_token: str = Query(..., alias="session_token")):
-    _validate_session_token(session_token)
+async def stream_dashboard(token: str = Depends(verify_session)):
     return StreamingResponse(
         dashboard_events.stream(),
         media_type="text/event-stream",
@@ -783,6 +1067,13 @@ async def get_profile(profile_id: int, token: str = Depends(verify_session)):
 
 @app.put("/api/profiles/{profile_id}")
 async def update_profile(profile_id: int, request: UpdateProfileRequest, token: str = Depends(verify_session)):
+    async with execution_gate.hold("update_profile", profile_id=profile_id):
+        _require_profile_not_onboarding(profile_id)
+        return await _update_profile_locked(profile_id, request)
+
+
+async def _update_profile_locked(profile_id: int, request: UpdateProfileRequest):
+    _require_profile_not_onboarding(profile_id)
     profile = await profile_db.get_profile(profile_id)
     if not profile:
         raise HTTPException(404, "不存在")
@@ -828,6 +1119,9 @@ async def update_profile(profile_id: int, request: UpdateProfileRequest, token: 
         )
 
     if update_data:
+        # A generic edit ends the exact fresh-profile provenance established by
+        # /api/login-slots/prepare. Prepare a new Profile for an owner invite.
+        update_data["login_slot_prepared"] = 0
         await profile_db.update_profile(profile_id, **update_data)
         await dashboard_events.publish("profile_updated", {"profile_id": profile_id})
     return {"success": True}
@@ -835,14 +1129,23 @@ async def update_profile(profile_id: int, request: UpdateProfileRequest, token: 
 
 @app.post("/api/profiles/import-accounts")
 async def import_accounts(request: ImportAccountsRequest, token: str = Depends(verify_session)):
+    async with execution_gate.hold("import_accounts"):
+        _require_no_onboarding_slots()
+        return await _import_accounts_locked(request)
+
+
+async def _import_accounts_locked(request: ImportAccountsRequest):
+    _require_no_onboarding_slots()
     items = _parse_account_import_content(request.content)
     created = 0
     updated = 0
     skipped = 0
 
     for item in items:
+        _require_no_onboarding_slots()
         existing = await profile_db.get_profile_by_name(item["name"])
         if existing:
+            _require_profile_not_onboarding(existing["id"])
             if not request.update_existing:
                 skipped += 1
                 continue
@@ -882,6 +1185,7 @@ async def import_accounts(request: ImportAccountsRequest, token: str = Depends(v
 
 @app.delete("/api/profiles/{profile_id}")
 async def delete_profile(profile_id: int, token: str = Depends(verify_session)):
+    _require_profile_not_onboarding(profile_id)
     profile = await profile_db.get_profile(profile_id)
     if not profile:
         raise HTTPException(404, "不存在")
@@ -890,6 +1194,7 @@ async def delete_profile(profile_id: int, token: str = Depends(verify_session)):
         profile_id=profile_id,
         profile_name=profile.get("name", ""),
     ):
+        _require_profile_not_onboarding(profile_id)
         await browser_manager.close_browser(profile_id)
         await browser_manager.delete_profile_data(profile_id)
         await profile_db.delete_profile(profile_id)
@@ -899,6 +1204,8 @@ async def delete_profile(profile_id: int, token: str = Depends(verify_session)):
 
 @app.post("/api/profiles/{profile_id}/launch")
 async def launch_browser(profile_id: int, token: str = Depends(verify_session)):
+    _require_no_onboarding_slots()
+    _require_profile_not_onboarding(profile_id)
     if not config.enable_vnc:
         raise HTTPException(400, "已禁用 VNC 登录（设置 ENABLE_VNC=1 可启用）")
     profile = await profile_db.get_profile(profile_id)
@@ -909,6 +1216,8 @@ async def launch_browser(profile_id: int, token: str = Depends(verify_session)):
         profile_id=profile_id,
         profile_name=profile.get("name", ""),
     ):
+        _require_no_onboarding_slots()
+        _require_profile_not_onboarding(profile_id)
         success = await browser_manager.launch_for_login(profile_id)
     if not success:
         raise HTTPException(500, "启动失败")
@@ -918,6 +1227,7 @@ async def launch_browser(profile_id: int, token: str = Depends(verify_session)):
 
 @app.post("/api/profiles/{profile_id}/close")
 async def close_browser(profile_id: int, token: str = Depends(verify_session)):
+    _require_profile_not_onboarding(profile_id)
     profile = await profile_db.get_profile(profile_id)
     if not profile:
         raise HTTPException(404, "不存在")
@@ -926,6 +1236,7 @@ async def close_browser(profile_id: int, token: str = Depends(verify_session)):
         profile_id=profile_id,
         profile_name=profile.get("name", ""),
     ):
+        _require_profile_not_onboarding(profile_id)
         result = await browser_manager.close_browser(profile_id)
     await dashboard_events.publish("browser_close", {"profile_id": profile_id})
     return result
@@ -936,18 +1247,26 @@ async def check_login(profile_id: int, token: str = Depends(verify_session)):
     profile = await profile_db.get_profile(profile_id)
     if not profile:
         raise HTTPException(404, "不存在")
+    slot = await login_slots.get_profile_slot(profile_id)
     async with execution_gate.hold(
         "check_login",
         profile_id=profile_id,
         profile_name=profile.get("name", ""),
     ):
-        result = await browser_manager.check_login_status(profile_id)
+        if slot:
+            try:
+                result = await login_slots.check_owner_login(slot)
+            except LoginSlotError as exc:
+                raise HTTPException(exc.status_code, str(exc)) from exc
+        else:
+            result = await browser_manager.check_login_status(profile_id)
     await dashboard_events.publish("login_checked", {"profile_id": profile_id})
     return result
 
 
 @app.post("/api/profiles/{profile_id}/import-cookies")
 async def import_cookies(profile_id: int, request: ImportCookiesRequest, token: str = Depends(verify_session)):
+    _require_profile_not_onboarding(profile_id)
     cookies_json = (request.cookies_json or "").strip()
     if not cookies_json:
         raise HTTPException(400, "Cookie 内容不能为空")
@@ -959,6 +1278,7 @@ async def import_cookies(profile_id: int, request: ImportCookiesRequest, token: 
         profile_id=profile_id,
         profile_name=profile.get("name", ""),
     ):
+        _require_profile_not_onboarding(profile_id)
         result = await browser_manager.import_cookies(profile_id, cookies_json)
     if not result.get("success"):
         raise HTTPException(400, result.get("error") or "导入失败")
@@ -972,6 +1292,7 @@ async def export_cookies(
     kind: str = Query("google", description="session|google，默认 google"),
     token: str = Depends(verify_session),
 ):
+    _require_profile_not_onboarding(profile_id)
     profile = await profile_db.get_profile(profile_id)
     if not profile:
         raise HTTPException(404, "不存在")
@@ -985,6 +1306,7 @@ async def export_cookies(
         profile_id=profile_id,
         profile_name=profile.get("name", ""),
     ):
+        _require_profile_not_onboarding(profile_id)
         result = await browser_manager.export_cookies(profile_id)
     if not result.get("success"):
         error = result.get("error") or "导出失败"
@@ -996,6 +1318,7 @@ async def export_cookies(
 
 @app.post("/api/profiles/{profile_id}/protocol-login")
 async def protocol_login(profile_id: int, request: ProtocolLoginRequest, token: str = Depends(verify_session)):
+    _require_profile_not_onboarding(profile_id)
     from .protocol_login import protocol_loginer
 
     profile = await profile_db.get_profile(profile_id)
@@ -1011,6 +1334,7 @@ async def protocol_login(profile_id: int, request: ProtocolLoginRequest, token: 
         profile_id=profile_id,
         profile_name=profile.get("name", ""),
     ):
+        _require_profile_not_onboarding(profile_id)
         proxy_url = profile.get("proxy_url") if profile.get("proxy_enabled") else None
         if profile.get("proxy_enabled") and not proxy_url:
             raise HTTPException(400, "源 Profile 已启用代理但未填写地址，已停止请求以避免使用默认出口")
@@ -1050,6 +1374,7 @@ async def protocol_login(profile_id: int, request: ProtocolLoginRequest, token: 
 
 @app.post("/api/profiles/{profile_id}/auto-login")
 async def auto_login_profile(profile_id: int, token: str = Depends(verify_session)):
+    _require_profile_not_onboarding(profile_id)
     profile = await profile_db.get_profile(profile_id)
     if not profile:
         raise HTTPException(404, "不存在")
@@ -1058,6 +1383,7 @@ async def auto_login_profile(profile_id: int, token: str = Depends(verify_sessio
         profile_id=profile_id,
         profile_name=profile.get("name", ""),
     ):
+        _require_profile_not_onboarding(profile_id)
         result = await browser_manager.auto_login(profile_id)
     await dashboard_events.publish(
         "profile_auto_login",
@@ -1070,6 +1396,7 @@ async def auto_login_profile(profile_id: int, token: str = Depends(verify_sessio
 
 @app.post("/api/profiles/{profile_id}/extract")
 async def extract_token(profile_id: int, token: str = Depends(verify_session)):
+    _require_profile_not_onboarding(profile_id)
     profile = await profile_db.get_profile(profile_id)
     if not profile:
         raise HTTPException(404, "不存在")
@@ -1078,6 +1405,7 @@ async def extract_token(profile_id: int, token: str = Depends(verify_session)):
         profile_id=profile_id,
         profile_name=profile.get("name", ""),
     ):
+        _require_profile_not_onboarding(profile_id)
         extracted = await browser_manager.extract_token(profile_id)
     if extracted:
         return {"success": True, "token_length": len(extracted)}
@@ -1086,6 +1414,7 @@ async def extract_token(profile_id: int, token: str = Depends(verify_session)):
 
 @app.post("/api/profiles/{profile_id}/sync")
 async def sync_profile(profile_id: int, token: str = Depends(verify_session)):
+    _require_profile_not_onboarding(profile_id)
     result = await token_syncer.sync_profile(profile_id, source="manual")
     await dashboard_events.publish(
         "manual_sync",
@@ -1163,6 +1492,7 @@ async def ext_list_profiles(api_key: str = Depends(verify_api_key)):
 
 @app.get("/v1/profiles/{profile_id}/token")
 async def ext_get_token(profile_id: int, api_key: str = Depends(verify_api_key)):
+    _require_profile_not_onboarding(profile_id)
     profile = await profile_db.get_profile(profile_id)
     if not profile:
         raise HTTPException(404, "Profile not found")
@@ -1182,6 +1512,7 @@ async def ext_get_token(profile_id: int, api_key: str = Depends(verify_api_key))
 
 @app.post("/v1/profiles/{profile_id}/sync")
 async def ext_sync_profile(profile_id: int, api_key: str = Depends(verify_api_key)):
+    _require_profile_not_onboarding(profile_id)
     profile = await profile_db.get_profile(profile_id)
     if not profile:
         raise HTTPException(404, "Profile not found")
