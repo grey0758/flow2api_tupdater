@@ -41,7 +41,7 @@ jobs:
           name=flow2api-login-slot-smoke
           cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
-          docker run -d --name "$name" \
+          docker run -d --name "$name" --memory 3g \
             -e ADMIN_PASSWORD=ci-admin-only \
             -e VNC_PASSWORD=ci-vnc-only \
             -v "$GITHUB_WORKSPACE/scripts/smoke_login_slots.py:/tmp/smoke_login_slots.py:ro" \

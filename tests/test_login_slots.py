@@ -225,6 +225,21 @@ async def test_failed_stop_quarantines_slot(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_failed_browser_close_quarantines_slot():
+    manager = LoginSlots()
+    context = SimpleNamespace(close=AsyncMock(side_effect=RuntimeError("close failed")))
+    slot = LoginSlot(1, 82, "invite", time.time() + 30, context=context, state="ready")
+    manager._slots[1] = slot
+    manager._stack = AsyncMock(return_value=True)
+
+    await manager.release(1, expected=slot)
+
+    assert manager.has_slot(1)
+    assert slot.state == "quarantined"
+    assert slot.closed.is_set()
+
+
+@pytest.mark.asyncio
 async def test_old_slot_object_cannot_finish_reused_number():
     manager = LoginSlots()
     old = LoginSlot(1, 91, "old", time.time() + 30, state="ready")

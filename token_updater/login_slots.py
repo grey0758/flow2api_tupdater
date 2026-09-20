@@ -205,14 +205,18 @@ class LoginSlots:
     async def _cleanup_slot(self, slot: LoginSlot) -> None:
         slot.state = "closing"
         slot.closed.set()
+        context_closed = True
         try:
             if slot.context:
                 await slot.context.close()
                 slot.context = None
+        except Exception:
+            context_closed = False
+            logger.warning("登录槽位浏览器关闭失败；隔离槽位 %s", slot.number)
         finally:
             stopped = await self._stack(slot.number, "stop")
             async with self._lock:
-                if stopped is False:
+                if stopped is False or not context_closed:
                     slot.state = "quarantined"
                 elif self._slots.get(slot.number) is slot:
                     del self._slots[slot.number]
