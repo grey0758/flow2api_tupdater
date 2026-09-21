@@ -4,8 +4,9 @@ Status: **DEPLOYED FOR TWO OWNER LOGINS; ACCOUNTS NOT YET ACCEPTED**. On
 2026-09-20 UTC sgp011 changed from the single root desktop to the isolated
 release Compose. The control API remains loopback-only; the public Updater
 vhost retains independent Basic Auth and now has an exact WebSocket Upgrade
-route. Two fresh inactive candidates, Updater profiles7 and8, are currently
-open in slots1 and2 for the owners. Their capability URLs are short-lived and
+route. Following restart-safe retirement of two lost invitations, two fresh
+inactive candidates, Updater profiles12 and13, are currently open in slots1
+and2 for the owners. Their capability URLs are short-lived and
 must never be written to this repository. A completed visible login still is
 not a Flow pool entry: real same-context provider ownership, serial extract /
 deduplication, scoped backups, exactly one sync and isolated acceptance remain
@@ -19,6 +20,13 @@ slots inherit this vhost-level authentication automatically. Do not add a
 plaintext password to Compose, environment files, this repository, logs or
 Curator. The historical raw-IP VNC entrance remains on its separate
 credential file and is not changed by slot credential rotation.
+
+The workspace-approved `$send-personal-wecom` route may carry an explicitly
+scoped short-lived invitation and the owner-supplied Basic Auth fields to its
+allowlisted recipient. Keep those values only in the live command pipeline;
+do not store capabilities, plaintext passwords or provider message IDs. Do
+not put Basic Auth in URL userinfo. Send the username/password as separate
+fields beside the invitation URLs in one exact notification.
 
 ## Operator workflow
 
