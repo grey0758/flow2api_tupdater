@@ -11,6 +11,15 @@ not a Flow pool entry: real same-context provider ownership, serial extract /
 deduplication, scoped backups, exactly one sync and isolated acceptance remain
 mandatory for each identity.
 
+The shared Basic Auth policy for concurrent owner-login slots uses the
+non-secret username `flowlogin`. Its password is owner-supplied out of band;
+only the irreversible hash is stored on sgp011 in the dedicated root-managed
+file `/etc/nginx/sgp011-flow-updater-public.htpasswd`. Existing and later
+slots inherit this vhost-level authentication automatically. Do not add a
+plaintext password to Compose, environment files, this repository, logs or
+Curator. The historical raw-IP VNC entrance remains on its separate
+credential file and is not changed by slot credential rotation.
+
 ## Operator workflow
 
 1. Sign in to the administrator console and open `/account-import`.

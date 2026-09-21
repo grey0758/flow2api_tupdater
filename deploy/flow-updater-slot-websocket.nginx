@@ -1,6 +1,9 @@
 # Insert inside the existing HTTPS flow-updater.opencodex.uk server after
-# safe cutover to the isolated release control plane. Inherit the existing
-# server-level independent Basic Auth; do not expose raw worker RFB ports.
+# safe cutover to the isolated release control plane. All present and future
+# slots inherit the server-level independent Basic Auth. On sgp011 its
+# non-secret username is flowlogin and its host-only password hash is in
+# /etc/nginx/sgp011-flow-updater-public.htpasswd. Never commit the password or
+# the hash. Do not expose raw worker RFB ports.
 location = /login-slots/vnc/websockify {
     proxy_pass http://127.0.0.1:18083;
     proxy_http_version 1.1;
