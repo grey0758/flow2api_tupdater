@@ -3,7 +3,8 @@ import base64
 import os
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -345,6 +346,41 @@ def test_worker_project_gate_requires_authenticated_provider_response():
     assert "PROJECT_API_PATH" in source
     assert "candidates & self.provider_project_ids" in source
     assert "project_ownership_unverified" in source
+
+
+@pytest.mark.asyncio
+async def test_worker_opens_flow_and_labs_auth_tabs(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
+    monkeypatch.setenv("LOGIN_SLOT_NUMBER", "1")
+    from token_updater import login_worker as module
+
+    flow_page = SimpleNamespace(goto=AsyncMock())
+    labs_page = SimpleNamespace(goto=AsyncMock())
+    context = SimpleNamespace(
+        pages=[flow_page],
+        new_page=AsyncMock(return_value=labs_page),
+        on=MagicMock(),
+    )
+    chromium = SimpleNamespace(
+        launch_persistent_context=AsyncMock(return_value=context),
+    )
+    worker = module.LoginWorker.__new__(module.LoginWorker)
+    worker.context = None
+    worker.playwright = SimpleNamespace(chromium=chromium)
+    worker.proxy_url = "direct://"
+    worker.provider_project_ids = set()
+    monkeypatch.setattr(module.LoginWorker, "_safe_profile_dir", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(module, "configure_web_only_profile", lambda _: None)
+
+    await worker._open_browser()
+
+    flow_page.goto.assert_awaited_once_with(
+        module.FLOW_URL, wait_until="domcontentloaded", timeout=90000,
+    )
+    labs_page.goto.assert_awaited_once_with(
+        module.LABS_AUTH_URL, wait_until="domcontentloaded", timeout=90000,
+    )
+    context.on.assert_called_once_with("response", worker._record_provider_project_response)
 
 
 @pytest.mark.asyncio

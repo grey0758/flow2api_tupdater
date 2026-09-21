@@ -93,6 +93,8 @@ export LOGIN_SLOT_RUNTIME_ROOT="$runtime_root"
 export UPDATER_NETWORK_NAME="$network"
 export LOGIN_SLOT1_LABS_URL="$slot1_url"
 export LOGIN_SLOT2_LABS_URL="$slot2_url"
+export LOGIN_SLOT1_LABS_AUTH_URL="$slot1_url"
+export LOGIN_SLOT2_LABS_AUTH_URL="$slot2_url"
 
 docker compose -p "$project" \
   -f docker-compose.login-slots.yml \

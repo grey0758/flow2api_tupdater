@@ -49,7 +49,14 @@ PUBLIC_KEY = os.getenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", "")
 SLOT_NUMBER = int(os.getenv("LOGIN_SLOT_NUMBER", "0"))
 DISPLAY = os.getenv("DISPLAY", ":99")
 RESOLUTION = os.getenv("RESOLUTION", "1365x768x24")
-LABS_URL = os.getenv("LABS_URL", "https://labs.google/fx/tools/flow")
+FLOW_URL = os.getenv(
+    "FLOW_URL",
+    os.getenv("LABS_URL", "https://labs.google/fx/tools/flow"),
+)
+LABS_AUTH_URL = os.getenv(
+    "LABS_AUTH_URL",
+    "https://labs.google/fx/api/auth/signin?callbackUrl=https%3A%2F%2Flabs.google%2Ffx",
+)
 RUNTIME_DIR = Path(os.getenv("LOGIN_WORKER_RUNTIME_DIR", "/run/flow-login-worker"))
 XAUTHORITY = RUNTIME_DIR / ".Xauthority"
 HOME_DIR = Path(os.getenv("HOME", "/tmp/login-worker-home"))
@@ -357,8 +364,10 @@ class LoginWorker:
             ],
         )
         self.context.on("response", self._record_provider_project_response)
-        page = self.context.pages[0] if self.context.pages else await self.context.new_page()
-        await page.goto(LABS_URL, wait_until="domcontentloaded", timeout=90000)
+        flow_page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+        await flow_page.goto(FLOW_URL, wait_until="domcontentloaded", timeout=90000)
+        labs_page = await self.context.new_page()
+        await labs_page.goto(LABS_AUTH_URL, wait_until="domcontentloaded", timeout=90000)
 
     def _scope(self, generation: str, profile_id: int) -> None:
         if generation != self.generation or profile_id != self.profile_id:

@@ -79,6 +79,8 @@ export LOGIN_SLOT_RUNTIME_ROOT="$root/runtime"
 export UPDATER_NETWORK_NAME=sgp011-flow-updater-v34
 export LOGIN_SLOT1_LABS_URL="$slot1_url"
 export LOGIN_SLOT2_LABS_URL="$slot2_url"
+export LOGIN_SLOT1_LABS_AUTH_URL="$slot1_url"
+export LOGIN_SLOT2_LABS_AUTH_URL="$slot2_url"
 
 sudo -E docker compose -p "$project" -f "$compose" up -d --no-build --wait
 

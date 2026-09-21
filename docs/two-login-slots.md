@@ -56,6 +56,12 @@ fields beside the invitation URLs in one exact notification.
 
 Visible login completion is never evidence that an account is schedulable.
 
+New worker launches open two tabs in the same isolated Profile: the Flow tool
+and the supported Labs OAuth entry. The owner must complete both layers in
+that one Profile, enter a real Flow project and let it finish loading before
+selecting **I completed login**. The two tabs are convenience only; they do
+not weaken the same-context project-response gate or prove pool acceptance.
+
 ## Isolation and access boundary
 
 - Each worker has its own PID/mount/network namespace, Xvfb `:99`, and VNC

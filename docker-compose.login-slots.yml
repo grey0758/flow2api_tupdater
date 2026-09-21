@@ -134,7 +134,8 @@ services:
       RESOLUTION: "1365x768x24"
       HOME: /tmp/login-worker-home
       LOG_DIR: /tmp/logs
-      LABS_URL: ${LOGIN_SLOT1_LABS_URL:-https://labs.google/fx/tools/flow}
+      FLOW_URL: ${LOGIN_SLOT1_FLOW_URL:-${LOGIN_SLOT1_LABS_URL:-https://labs.google/fx/tools/flow}}
+      LABS_AUTH_URL: ${LOGIN_SLOT1_LABS_AUTH_URL:-https://labs.google/fx/api/auth/signin?callbackUrl=https%3A%2F%2Flabs.google%2Ffx}
       PLAYWRIGHT_BROWSERS_PATH: /root/.cache/ms-playwright
     volumes:
       - login_profile_1:/slot/profile
@@ -172,7 +173,8 @@ services:
       RESOLUTION: "1365x768x24"
       HOME: /tmp/login-worker-home
       LOG_DIR: /tmp/logs
-      LABS_URL: ${LOGIN_SLOT2_LABS_URL:-https://labs.google/fx/tools/flow}
+      FLOW_URL: ${LOGIN_SLOT2_FLOW_URL:-${LOGIN_SLOT2_LABS_URL:-https://labs.google/fx/tools/flow}}
+      LABS_AUTH_URL: ${LOGIN_SLOT2_LABS_AUTH_URL:-https://labs.google/fx/api/auth/signin?callbackUrl=https%3A%2F%2Flabs.google%2Ffx}
       PLAYWRIGHT_BROWSERS_PATH: /root/.cache/ms-playwright
     volumes:
       - login_profile_2:/slot/profile
