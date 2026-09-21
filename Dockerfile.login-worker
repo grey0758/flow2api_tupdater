@@ -17,6 +17,7 @@ WORKDIR /app
 RUN (getent group 12000 >/dev/null || groupadd --gid 12000 login-slots) \
     && (getent passwd 11001 >/dev/null || useradd --uid 11001 --gid 12000 --no-create-home --shell /usr/sbin/nologin login-slot1) \
     && (getent passwd 11002 >/dev/null || useradd --uid 11002 --gid 12000 --no-create-home --shell /usr/sbin/nologin login-slot2) \
+    && (getent passwd 11003 >/dev/null || useradd --uid 11003 --gid 12000 --no-create-home --shell /usr/sbin/nologin login-slot3) \
     && python -c 'import cryptography' \
     && chmod a+rx /root /root/.cache \
     && chmod -R a+rX /root/.cache/ms-playwright

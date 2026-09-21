@@ -111,7 +111,7 @@ def _uuid_values(value: Any) -> set[str]:
 
 class LoginWorker:
     def __init__(self) -> None:
-        if not PUBLIC_KEY or SLOT_NUMBER not in {1, 2}:
+        if not PUBLIC_KEY or SLOT_NUMBER not in {1, 2, 3}:
             raise RuntimeError("worker public key and slot number are required")
         self.guard = ReplayGuard(PUBLIC_KEY, SLOT_NUMBER)
         self.lock = asyncio.Lock()

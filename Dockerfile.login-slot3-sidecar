@@ -1,0 +1,15 @@
+ARG BASE_IMAGE=flow2api-token-updater-login-worker:local
+FROM ${BASE_IMAGE}
+
+USER root
+COPY token_updater/ /app/token_updater/
+
+RUN (getent passwd 11003 >/dev/null || useradd --uid 11003 --gid 12000 --no-create-home --shell /usr/sbin/nologin login-slot3) \
+    && (getent passwd 12003 >/dev/null || useradd --uid 12003 --gid 12000 --no-create-home --shell /usr/sbin/nologin login-slot3-sidecar) \
+    && chmod -R a+rX /app/token_updater \
+    && mkdir -p /run/login-slot3 \
+    && chown 12003:12000 /run/login-slot3 \
+    && chmod 0770 /run/login-slot3
+
+USER 12003:12000
+CMD ["python", "-m", "token_updater.login_slot_sidecar"]
