@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 from token_updater.updater import TokenSyncer
@@ -28,7 +28,7 @@ class TokenSyncerBatchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_syncs_when_target_token_missing(self):
         syncer = TokenSyncer()
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         profiles = [
             {
                 "id": 1,
@@ -58,7 +58,7 @@ class TokenSyncerBatchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_syncs_when_profile_is_overdue_even_if_target_healthy(self):
         syncer = TokenSyncer()
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         profiles = [
             {
                 "id": 2,
@@ -96,7 +96,7 @@ class TokenSyncerBatchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_skips_recent_healthy_profile(self):
         syncer = TokenSyncer()
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         profiles = [
             {
                 "id": 3,
@@ -112,6 +112,8 @@ class TokenSyncerBatchTests(unittest.IsolatedAsyncioTestCase):
                 "email": "gamma@example.com",
                 "is_active": True,
                 "needs_refresh": False,
+                "project_owned": True,
+                "at_expires": (now + timedelta(hours=6)).isoformat(),
             }
         ]
 

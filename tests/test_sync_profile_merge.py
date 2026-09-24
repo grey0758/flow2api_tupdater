@@ -79,6 +79,62 @@ class TokenSyncerMergeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["error_code"], "onboarding_acknowledgement_mismatch")
 
+    async def test_claimed_profile_accepts_exact_existing_account_update_branch(self):
+        syncer = TokenSyncer()
+        project_id = "0f6ddfcf-11ce-4a79-9792-b23cc4d189aa"
+        profile = {
+            "id": 101,
+            "name": "existing-slot-profile",
+            "login_slot_claimed": 1,
+            "sync_count": 0,
+            "is_active": 1,
+            "is_logged_in": 1,
+            "email": "owner@example.test",
+            "observed_flow_project_verified": 1,
+            "observed_flow_project_id": project_id,
+            "observed_flow_project_identity": "owner@example.test",
+            "google_cookies": json.dumps(JAR),
+            "flow2api_url": "http://example.com",
+            "connection_token_override": "token-101",
+            "error_count": 0,
+        }
+        updated = {
+            "success": True,
+            "action": "updated",
+            "email": "owner@example.test",
+            "oauth_verified": True,
+            "project_context_accepted": True,
+            "project_owned": True,
+            "project_reused": False,
+            "pending_enable": False,
+            "account_active": True,
+            "token_id": 11,
+        }
+
+        with (
+            patch(
+                "token_updater.updater.profile_db.get_profile",
+                AsyncMock(return_value=profile),
+            ),
+            patch(
+                "token_updater.updater.browser_manager.extract_token",
+                AsyncMock(return_value="session"),
+            ),
+            patch.object(syncer, "_push_to_flow2api", AsyncMock(return_value=updated)),
+            patch.object(
+                syncer,
+                "_verify_destination_session",
+                AsyncMock(return_value={"success": True}),
+            ) as verify,
+            patch("token_updater.updater.profile_db.update_profile", AsyncMock()),
+            patch("token_updater.updater.profile_db.record_sync_event", AsyncMock()),
+            patch("token_updater.updater.dashboard_events.publish", AsyncMock()),
+        ):
+            result = await syncer._sync_profile(101)
+
+        self.assertTrue(result["success"])
+        verify.assert_awaited_once()
+
     async def test_gemini_mode_keeps_gemini_cookie_flow(self):
         syncer = TokenSyncer()
         profile = {
@@ -214,6 +270,10 @@ class TokenSyncerMergeTests(unittest.IsolatedAsyncioTestCase):
                     {"success": True, "action": "updated", "message": ""},
                 ]),
             ) as push_to_flow2api,
+            patch.object(
+                syncer, "_verify_destination_session",
+                AsyncMock(return_value={"success": True}),
+            ),
             patch("token_updater.updater.profile_db.update_profile", AsyncMock()) as update_profile,
             patch("token_updater.updater.profile_db.record_sync_event", AsyncMock()),
             patch("token_updater.updater.dashboard_events.publish", AsyncMock()),
@@ -253,6 +313,10 @@ class TokenSyncerMergeTests(unittest.IsolatedAsyncioTestCase):
                 "_push_to_flow2api",
                 AsyncMock(return_value={"success": True, "action": "updated", "message": ""}),
             ) as push_to_flow2api,
+            patch.object(
+                syncer, "_verify_destination_session",
+                AsyncMock(return_value={"success": True}),
+            ),
             patch("token_updater.updater.profile_db.update_profile", AsyncMock()),
             patch("token_updater.updater.profile_db.record_sync_event", AsyncMock()),
             patch("token_updater.updater.dashboard_events.publish", AsyncMock()),
@@ -298,6 +362,10 @@ class TokenSyncerMergeTests(unittest.IsolatedAsyncioTestCase):
                 "_push_to_flow2api",
                 AsyncMock(return_value={"success": True, "action": "updated", "message": ""}),
             ) as push_to_flow2api,
+            patch.object(
+                syncer, "_verify_destination_session",
+                AsyncMock(return_value={"success": True}),
+            ),
             patch("token_updater.updater.profile_db.update_profile", AsyncMock()) as update_profile,
             patch("token_updater.updater.profile_db.record_sync_event", AsyncMock()),
             patch("token_updater.updater.dashboard_events.publish", AsyncMock()),

@@ -41,10 +41,10 @@ fields beside the invitation URLs in one exact notification.
    A second operator may do the same for another Profile. Slot saturation or
    reuse of a Profile returns HTTP 409; no existing browser is closed.
 4. Each owner performs only visible Google, Flow and Labs authorization in the
-   assigned page, then selects **I completed login**. This leaves that exact
-   desktop open in `awaiting_check`; the page has no sync, Cookie export,
-   activation or account-administration controls.
-5. The administrator runs one serialized `check-login` against that exact
+   assigned page and leaves it open. There is no completion button; the page
+   has no sync, Cookie export, activation or account-administration controls.
+5. The administrator runs one serialized `check-login` directly from `ready`
+   against that exact
    context. It validates Labs session, credits and complete Cookies before it
    binds a project observed in the same context. A failed check returns the
    same private desktop to the same owner; a successful check closes it.
@@ -53,14 +53,20 @@ fields beside the invitation URLs in one exact notification.
    and Flow SQLite backups plus the read-only NewAPI boundary, exactly one
    supported sync, explicit pending-account enablement and one isolated image
    acceptance.
+7. A successful no-cost check is not final success. Only the isolated image's
+   unique Flow/NewAPI attribution and complete decode admit the account to the
+   scheduling pool.
 
 Visible login completion is never evidence that an account is schedulable.
 
 New worker launches open two tabs in the same isolated Profile: the Flow tool
 and the supported Labs OAuth entry. The owner must complete both layers in
-that one Profile, enter a real Flow project and let it finish loading before
-selecting **I completed login**. The two tabs are convenience only; they do
-not weaken the same-context project-response gate or prove pool acceptance.
+that one Profile and enter a real Flow project. No completion button is needed.
+The two tabs are convenience only; they do not weaken the same-context
+project-response gate or prove pool acceptance. A modern Flow HTML 200 and
+visible editor establish browser access but are not by themselves an
+account-bound project-ownership response; validation must fail closed until
+that separate proof is available.
 
 ## Isolation and access boundary
 

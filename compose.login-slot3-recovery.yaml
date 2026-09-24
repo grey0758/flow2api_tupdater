@@ -1,0 +1,124 @@
+name: flow2api-token-updater-login-slot3
+
+x-common: &common
+  restart: "no"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+
+x-egress: &egress
+  <<: *common
+  image: ${LOGIN_SLOT3_EGRESS_IMAGE:-flow2api-token-updater-login-worker:secure-final}
+  user: "12001:12000"
+  mem_limit: 128m
+  pids_limit: 64
+  cpus: 0.25
+  networks: [updater_internal]
+  tmpfs:
+    - /app/data:ro,nosuid,nodev,noexec,size=64k
+    - /app/logs:ro,nosuid,nodev,noexec,size=64k
+    - /app/profiles:ro,nosuid,nodev,noexec,size=64k
+  healthcheck:
+    test: [CMD-SHELL, "test -S /egress/proxy.sock"]
+    interval: 5s
+    timeout: 2s
+    retries: 12
+
+services:
+  login-egress-3:
+    <<: *egress
+    container_name: flow-login-egress-3
+    volumes:
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/egress3:/egress
+    command: [python, -m, token_updater.login_egress]
+
+  login-worker-3:
+    <<: *common
+    image: ${LOGIN_SLOT3_WORKER_IMAGE:?recovery worker image required}
+    container_name: flow-login-worker-3
+    user: "11003:12000"
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:/opt/flow2api-login-slot3-build/deploy/login-worker-seccomp.json
+    network_mode: none
+    mem_limit: 2g
+    mem_reservation: 1536m
+    pids_limit: 320
+    cpus: 2.0
+    shm_size: 512m
+    depends_on:
+      login-egress-3:
+        condition: service_healthy
+    environment:
+      LOGIN_SLOT_NUMBER: "3"
+      LOGIN_SLOT_SIGNING_PUBLIC_KEY: ${LOGIN_SLOT3_SIGNING_PUBLIC_KEY:?public control key required}
+      LOGIN_PROFILE_DIR: /slot/profile
+      LOGIN_WORKER_SOCKET: /control/worker.sock
+      LOGIN_EGRESS_SOCKET: /egress/proxy.sock
+      LOGIN_WORKER_RUNTIME_DIR: /run/flow-login-worker
+      DISPLAY: ":99"
+      RESOLUTION: "1365x768x24"
+      HOME: /tmp/login-worker-home
+      LOG_DIR: /tmp/logs
+      FLOW_URL: ${LOGIN_SLOT3_FLOW_URL:-https://flow.google.com/}
+      LABS_AUTH_URL: ${LOGIN_SLOT3_LABS_AUTH_URL:-https://labs.google/fx/api/auth/signin?callbackUrl=https%3A%2F%2Flabs.google%2Ffx}
+      PLAYWRIGHT_BROWSERS_PATH: /root/.cache/ms-playwright
+    volumes:
+      - ${LOGIN_SLOT3_PROFILE_SOURCE:?existing profile path required}:/slot/profile
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/control3:/control
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/egress3:/egress:ro
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m,uid=11003,gid=12000,mode=1770
+      - /run:rw,nosuid,nodev,size=16m,uid=11003,gid=12000,mode=0700
+      - /app/data:ro,nosuid,nodev,noexec,size=64k
+      - /app/logs:ro,nosuid,nodev,noexec,size=64k
+      - /app/profiles:ro,nosuid,nodev,noexec,size=64k
+    healthcheck:
+      test: [CMD-SHELL, "test -S /control/worker.sock && kill -0 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+
+  login-slot3-sidecar:
+    <<: *common
+    image: ${LOGIN_SLOT3_SIDECAR_IMAGE:?recovery sidecar image required}
+    container_name: flow-login-slot3-sidecar
+    network_mode: none
+    user: "12003:33"
+    group_add: ["12000"]
+    mem_limit: 256m
+    mem_reservation: 128m
+    pids_limit: 64
+    cpus: 0.25
+    depends_on:
+      login-worker-3:
+        condition: service_healthy
+    environment:
+      LOGIN_SLOT3_PROFILE_ID: ${LOGIN_SLOT3_PROFILE_ID:?existing profile id required}
+      LOGIN_SLOT3_RECOVER_EXISTING: "1"
+      LOGIN_SLOT3_WORKER_SOCKET: /worker-control/worker.sock
+      LOGIN_SLOT3_SIDECAR_SOCKET: /sidecar/sidecar.sock
+      LOGIN_SLOT3_SIGNING_PRIVATE_KEY: ${LOGIN_SLOT3_SIGNING_PRIVATE_KEY:?private control key required}
+      LOGIN_SLOT3_ADMIN_TOKEN: ${LOGIN_SLOT3_ADMIN_TOKEN:?admin token required}
+    volumes:
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/control3:/worker-control:ro
+      - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/sidecar3:/sidecar
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m,uid=12003,gid=12000,mode=1770
+      - /app/data:ro,nosuid,nodev,noexec,size=64k
+      - /app/logs:ro,nosuid,nodev,noexec,size=64k
+      - /app/profiles:ro,nosuid,nodev,noexec,size=64k
+    command: [python, -m, token_updater.login_slot_sidecar]
+    healthcheck:
+      test: [CMD-SHELL, "test -S /sidecar/sidecar.sock && kill -0 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+      start_period: 10s
+
+networks:
+  updater_internal:
+    name: ${UPDATER_NETWORK_NAME:-sgp011-flow-updater-v34}
+    external: true

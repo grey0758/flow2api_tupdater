@@ -60,18 +60,30 @@ class LoginSlots:
         self._reconciled = False
 
     async def reconcile(self) -> None:
-        """Revoke lost invitations and quarantine unfinished persistent state.
+        """Revoke lost invitations and stop unfinished worker contexts.
 
-        Neither an old capability nor its generation is recreated on restart.
-        A claimed Profile becomes usable by the normal serial path only after
-        the worker has stopped and the completed handoff is durably recorded.
+        Owner capabilities remain memory-only and are never reconstructed.
+        The non-secret persisted generation is used exactly once to sign an
+        ``abort`` for a pre-restart worker context.  A later administrator
+        recovery rotates to a new generation and a new invitation.
         """
         from .database import profile_db
         profiles = await profile_db.get_all_profiles()
-        blocked = {
-            int(profile["id"]) for profile in profiles
+        unfinished = [
+            profile for profile in profiles
             if profile.get("login_slot_claimed") and not profile.get("login_slot_handoff_complete")
-        }
+        ]
+        blocked = {int(profile["id"]) for profile in unfinished}
+        claimed_by_number: dict[int, dict] = {}
+        for profile in unfinished:
+            number = int(profile.get("login_slot_number") or 0)
+            generation = str(profile.get("login_slot_generation") or "")
+            if number not in {1, 2} or not generation or len(generation) > 128:
+                continue
+            if number in claimed_by_number:
+                raise RuntimeError(f"multiple unfinished Profiles claim login slot {number}")
+            claimed_by_number[number] = profile
+
         quarantined = set()
         for number, uid in enumerate(config.login_slot_worker_ids, 1):
             stage, _ = self._slot_paths(number, 0)
@@ -79,6 +91,31 @@ class LoginSlots:
                 raise RuntimeError(f"login worker {number} Profile mount is not ready")
             if any(stage.iterdir()):
                 quarantined.add(number)
+                profile = claimed_by_number.get(number)
+                if profile:
+                    stale = LoginSlot(
+                        number=number,
+                        profile_id=int(profile["id"]),
+                        capability="",
+                        expires_at=0,
+                        worker_socket=config.login_slot_worker_sockets[number - 1],
+                        staging_dir=str(stage),
+                        worker_uid=uid,
+                        worker_proxy_url=config.login_slot_worker_proxy_urls[number - 1],
+                        generation=str(profile["login_slot_generation"]),
+                        state="quarantined",
+                    )
+                    stale.closed.set()
+                    try:
+                        result = await self._worker(stale, "abort", timeout=30)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"login worker {number} old generation could not be revoked"
+                        ) from exc
+                    if result.get("state") != "quarantined" or result.get("browser_running"):
+                        raise RuntimeError(
+                            f"login worker {number} did not release its old browser context"
+                        )
         async with self._lock:
             if self._slots:
                 raise RuntimeError("cannot reconcile live login invitations")
@@ -320,8 +357,9 @@ class LoginSlots:
                 if target.exists() and (not target.is_dir() or any(target.iterdir())):
                     raise LoginSlotError(409, "正式 Profile 目录已有数据；不可交给新邀请")
                 self._assert_empty_profile(stage, config.login_slot_worker_ids[number - 1])
+                generation = secrets.token_urlsafe(24)
                 from .database import profile_db
-                if not await profile_db.claim_login_slot(profile_id):
+                if not await profile_db.claim_login_slot(profile_id, number, generation):
                     raise LoginSlotError(409, "Profile 不再符合首次邀请条件")
                 self._blocked_profiles.add(profile_id)
                 slot = LoginSlot(
@@ -333,7 +371,7 @@ class LoginSlots:
                     staging_dir=str(stage),
                     worker_uid=config.login_slot_worker_ids[number - 1],
                     worker_proxy_url=config.login_slot_worker_proxy_urls[number - 1],
-                    generation=secrets.token_urlsafe(24),
+                    generation=generation,
                 )
                 self._slots[number] = slot
                 self._expiry_tasks[number] = asyncio.create_task(self._expire(slot))
@@ -360,6 +398,108 @@ class LoginSlots:
                         slot.state = "quarantined"
                         slot.closed.set()
                 raise
+
+    async def recover(self, profile: dict, number: int) -> LoginSlot:
+        """Issue a new invitation for an expired, exact-slot retained Profile.
+
+        Never reconstruct an old capability/generation or reset the claimed
+        database row.  A different slot or a live browser is a hard stop.
+        """
+        if not self._reconciled or number not in {1, 2}:
+            raise LoginSlotError(503, "登录槽位尚未完成安全对账")
+        profile_id = int(profile["id"])
+        if not (
+            profile.get("login_slot_claimed")
+            and not profile.get("login_slot_handoff_complete")
+            and not profile.get("is_active")
+            and not profile.get("is_logged_in")
+            and int(profile.get("sync_count") or 0) == 0
+            and int(profile.get("login_slot_number") or 0) == number
+            and (profile.get("proxy_url") or "") == config.login_slot_expected_source_proxy
+        ):
+            raise LoginSlotError(409, "该 Profile 不属于未交接的隔离登录槽位")
+
+        from .execution import execution_gate
+        async with execution_gate.hold("recover_login_slot", profile_id=profile_id):
+            async with self._lock:
+                previous = self._slots.get(number)
+                if previous and not (
+                    previous.profile_id == profile_id
+                    and previous.state == "quarantined"
+                    and previous.closed.is_set()
+                    and time.time() >= previous.expires_at
+                ):
+                    raise LoginSlotError(409, "该槽位仍在使用或不属于指定 Profile")
+                if any(
+                    slot.profile_id == profile_id and slot.number != number
+                    for slot in self._slots.values()
+                ):
+                    raise LoginSlotError(409, "该 Profile 已绑定其他槽位")
+                if profile_id not in self._blocked_profiles:
+                    raise LoginSlotError(409, "未找到该 Profile 的隔离交接记录")
+                stage, target = self._slot_paths(number, profile_id)
+                if (
+                    not stage.is_dir() or stage.is_symlink()
+                    or stage.stat().st_uid != config.login_slot_worker_ids[number - 1]
+                    or not any(stage.iterdir())
+                    or (target.exists() and (not target.is_dir() or any(target.iterdir())))
+                ):
+                    raise LoginSlotError(409, "原槽位数据与正式 Profile 边界不符")
+                from .browser import browser_manager
+                from .updater import token_syncer
+                if browser_manager.get_active_profile_id() is not None or token_syncer.is_syncing():
+                    raise LoginSlotError(409, "存在运行中的浏览器或同步")
+                previous_generation = str(profile.get("login_slot_generation") or "")
+                next_generation = secrets.token_urlsafe(24)
+                if not previous_generation:
+                    raise LoginSlotError(409, "该 Profile 缺少可撤销的槽位代际记录")
+                from .database import profile_db
+                if not await profile_db.rotate_login_slot_generation(
+                    profile_id,
+                    number,
+                    previous_generation,
+                    next_generation,
+                ):
+                    raise LoginSlotError(409, "该 Profile 的槽位代际已变化，请刷新后重试")
+                slot = LoginSlot(
+                    number=number,
+                    profile_id=profile_id,
+                    capability=secrets.token_urlsafe(32),
+                    expires_at=time.time() + INVITE_TTL_SECONDS,
+                    worker_socket=config.login_slot_worker_sockets[number - 1],
+                    staging_dir=str(stage),
+                    worker_uid=config.login_slot_worker_ids[number - 1],
+                    worker_proxy_url=config.login_slot_worker_proxy_urls[number - 1],
+                    generation=next_generation,
+                )
+                # Install the new scope before the signed worker request so a
+                # concurrent recovery cannot rebind the same volume.
+                self._slots[number] = slot
+                self._quarantined_numbers.add(number)
+            async with slot.lifecycle:
+                try:
+                    result = await self._worker(
+                        slot, "recover", payload={"proxy_url": slot.worker_proxy_url}, timeout=120,
+                    )
+                    if result.get("state") != "ready" or not result.get("browser_running"):
+                        raise RuntimeError("worker did not reopen the retained Profile")
+                    async with self._lock:
+                        if self._slots.get(number) is not slot:
+                            raise RuntimeError("recovery scope was replaced")
+                        slot.state = "ready"
+                        self._quarantined_numbers.discard(number)
+                        self._expiry_tasks[number] = asyncio.create_task(self._expire(slot))
+                    return slot
+                except BaseException:
+                    async with self._lock:
+                        if self._slots.get(number) is slot:
+                            slot.state = "quarantined"
+                            # No invitation was returned to an owner. Permit a
+                            # reviewed retry after the worker fault is fixed
+                            # without waiting for a phantom invitation TTL.
+                            slot.expires_at = 0
+                            slot.closed.set()
+                    raise
 
     async def _expire(self, slot: LoginSlot) -> None:
         await asyncio.sleep(max(0, slot.expires_at - time.time()))
@@ -416,8 +556,11 @@ class LoginSlots:
         async with slot.lifecycle:
             async with slot.input_gate:
                 async with self._lock:
-                    if self._slots.get(slot.number) is not slot or slot.state != "awaiting_check":
-                        raise LoginSlotError(409, "请先等待 owner 在该槽位报告登录完成")
+                    if (
+                        self._slots.get(slot.number) is not slot
+                        or slot.state not in {"ready", "awaiting_check"}
+                    ):
+                        raise LoginSlotError(409, "登录槽位当前不能执行管理员检查")
                     slot.state = "checking"
                 try:
                     result = await self._worker(slot, "validate", timeout=90)
@@ -462,7 +605,11 @@ class LoginSlots:
                     cleaned = await self._worker(slot, "cleanup", timeout=60)
                     if cleaned.get("state") != "idle" or any(Path(slot.staging_dir).iterdir()):
                         raise RuntimeError("worker cleanup did not empty the staging Profile")
-                    await profile_db.update_profile(slot.profile_id, login_slot_handoff_complete=1)
+                    await profile_db.update_profile(
+                        slot.profile_id,
+                        login_slot_handoff_complete=1,
+                        login_slot_generation=None,
+                    )
                 except Exception as exc:
                     slot.state = "quarantined"
                     slot.closed.set()

@@ -2,8 +2,6 @@ const title = document.getElementById("title");
 const instructions = document.getElementById("instructions");
 const status = document.getElementById("status");
 const frame = document.getElementById("vnc");
-const done = document.getElementById("done");
-let waitingForCheck = false;
 
 async function json(path, options = {}) {
   const response = await fetch(path, {
@@ -32,28 +30,13 @@ async function init() {
   frame.classList.remove("hidden");
 }
 
-done.addEventListener("click", async () => {
-  done.disabled = true;
-  try {
-    await json("/login-slots/complete", {method: "POST"});
-    waitingForCheck = true;
-    status.textContent = " 已通知管理员；请保留本页。检查通过后桌面会关闭，需补授权时可在同一桌面继续。";
-  } catch (error) {
-    done.disabled = false;
-    status.textContent = ` ${error.message}`;
-  }
-});
 setInterval(async () => {
-  if (!waitingForCheck) return;
   try {
     const session = await json("/login-slots/session");
-    if (session.state === "ready") {
-      waitingForCheck = false;
-      done.disabled = false;
-      status.textContent = " 检查尚未通过，请在同一桌面完成缺少的 Flow/Labs 步骤后再次提交。";
-    }
+    status.textContent = session.state === "checking"
+      ? " 管理员正在执行无成本检查，请暂时不要操作。"
+      : " 完成可见授权后保持本页打开；管理员会直接检查。";
   } catch (_) {
-    waitingForCheck = false;
     frame.remove();
     status.textContent = " 登录桌面已由管理员关闭；请等待后续串行验收。";
   }

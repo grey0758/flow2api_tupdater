@@ -1,0 +1,11 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+COPY token_updater/login_slot_vnc_reissue.py /app/token_updater/login_slot_vnc_reissue.py
+
+RUN (getent passwd 12003 >/dev/null || useradd --uid 12003 --gid 33 --no-create-home --shell /usr/sbin/nologin login-slot1-reissue) \
+    && chmod 0444 /app/token_updater/login_slot_vnc_reissue.py
+
+USER 12003:33
+CMD ["python", "-m", "token_updater.login_slot_vnc_reissue"]

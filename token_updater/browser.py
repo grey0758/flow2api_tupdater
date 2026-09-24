@@ -4,8 +4,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID
@@ -90,6 +92,8 @@ PASSWORD_SUBMIT_SELECTORS = [
 SUPERVISOR_CONF = "/etc/supervisor/conf.d/supervisord.conf"
 VNC_START_ORDER = ("xvfb", "fluxbox", "x11vnc", "novnc")
 VNC_STOP_ORDER = ("novnc", "x11vnc", "fluxbox", "xvfb")
+CHROMIUM_CHILD_PROFILE_PATTERN = re.compile(r"Profile [1-9][0-9]*\Z")
+CHROMIUM_PROFILE_BINDING_FILE = ".tupdater-chromium-profile"
 
 
 class BrowserManager:
@@ -102,6 +106,7 @@ class BrowserManager:
         self._lock = asyncio.Lock()
         self._session_errors: Dict[int, Dict[str, Any]] = {}
         self._flow_project_ids: Dict[int, str] = {}
+        self._background_xvfb_contexts: set[int] = set()
 
     def get_session_error(self, profile_id: int) -> Dict[str, Any]:
         return self._session_errors.get(profile_id, failure("auth_required", "无法取得完整有效会话，请在源 Profile 完成 Labs 和 Flow 登录"))
@@ -237,6 +242,35 @@ class BrowserManager:
                 profile.get("observed_flow_project_id")
             )
 
+    def _trusted_flow_project_id(
+        self,
+        profile: Dict[str, Any],
+        identity: str,
+        browser_project_id: Any = None,
+    ) -> Optional[str]:
+        """Preserve an identity-bound existing project over Chrome recency.
+
+        A multi-project account can redirect Flow home to its most recently
+        opened project.  Once account membership has been independently
+        verified and persisted for an existing token, that mutable browser
+        recency must not silently replace the receiver-bound project.
+        """
+        current_identity = self._normalize_email(identity)
+        bound_identity = self._normalize_email(
+            profile.get("observed_flow_project_identity") or ""
+        )
+        bound_project = self._normalize_flow_project_id(
+            profile.get("observed_flow_project_id")
+        )
+        if (
+            profile.get("observed_flow_project_verified")
+            and current_identity
+            and bound_identity == current_identity
+            and bound_project
+        ):
+            return bound_project
+        return self._normalize_flow_project_id(browser_project_id)
+
     async def check_login_slot_status(
         self, profile_id: int, context: BrowserContext
     ) -> Dict[str, Any]:
@@ -339,9 +373,110 @@ class BrowserManager:
                 "profile_name": profile["name"],
             }
 
+    @staticmethod
+    def _selected_chromium_profile(user_data_dir: str) -> Optional[str]:
+        """Return the control-plane-bound non-default Chromium profile.
+
+        Chrome's ``Local State.profile.last_used`` is mutable browser recency,
+        not an account binding.  A directory containing any ``Profile N``
+        child therefore requires the control process to install the explicit
+        mode-0600 binding marker.  A genuine single ``Default`` profile keeps
+        the historical behavior.
+        """
+        root = Path(user_data_dir)
+        binding = root / CHROMIUM_PROFILE_BINDING_FILE
+        if binding.exists():
+            if binding.is_symlink() or not binding.is_file():
+                raise ValueError("Chromium child profile binding is not a regular file")
+            details = binding.stat()
+            if details.st_uid != os.geteuid() or stat.S_IMODE(details.st_mode) != 0o600:
+                raise ValueError("Chromium child profile binding is not control-owned mode 0600")
+            try:
+                selected = binding.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError) as exc:
+                raise ValueError("Chromium child profile binding is invalid") from exc
+        else:
+            children = [
+                child.name
+                for child in root.iterdir()
+                if child.is_dir()
+                and not child.is_symlink()
+                and CHROMIUM_CHILD_PROFILE_PATTERN.fullmatch(child.name)
+            ] if root.is_dir() else []
+            if children:
+                raise ValueError(
+                    "Chromium user-data directory has child profiles but no trusted binding"
+                )
+            return None
+        if not selected:
+            raise ValueError("Chromium child profile binding is empty")
+        if selected != "Default" and not CHROMIUM_CHILD_PROFILE_PATTERN.fullmatch(selected):
+            raise ValueError("Chromium child profile selection is unsafe")
+        child = root / selected
+        if child.is_symlink() or not child.is_dir() or child.parent.resolve() != root.resolve():
+            raise ValueError("Chromium child profile directory is unavailable")
+        return selected
+
+    async def _ensure_background_xvfb(self) -> bool:
+        """Start only Xvfb for a transient headed browser, returning ownership."""
+        status = self._get_supervisor_status()
+        if status.get("xvfb") == "RUNNING":
+            return False
+        cp = self._supervisorctl("start", "xvfb", timeout=20.0)
+        if cp.returncode != 0:
+            raise RuntimeError("failed to start background Xvfb")
+        for _ in range(20):
+            if self._get_supervisor_status().get("xvfb") == "RUNNING":
+                await asyncio.sleep(0.4)
+                return True
+            await asyncio.sleep(0.1)
+        raise RuntimeError("background Xvfb did not become ready")
+
+    async def _stop_background_xvfb(self) -> None:
+        status = self._get_supervisor_status()
+        if any(status.get(name) == "RUNNING" for name in ("fluxbox", "x11vnc", "novnc")):
+            return
+        try:
+            self._supervisorctl("stop", "xvfb", timeout=10.0)
+        except Exception:
+            pass
+
     async def _launch_persistent_context(self, **kwargs):
-        configure_web_only_profile(kwargs["user_data_dir"])
-        return await self._playwright.chromium.launch_persistent_context(**kwargs)
+        user_data_dir = kwargs["user_data_dir"]
+        configure_web_only_profile(user_data_dir)
+        selected = self._selected_chromium_profile(user_data_dir)
+        args = list(kwargs.get("args") or [])
+        if any(str(arg).startswith("--profile-directory=") for arg in args):
+            raise ValueError("caller-supplied Chromium child profile is not allowed")
+        owns_background_xvfb = False
+        if selected:
+            if kwargs.get("headless") is True:
+                # Multi-profile Chromium can expose a different account store
+                # in headless mode. Use the same headed child-profile context
+                # that created the session without starting VNC listeners.
+                owns_background_xvfb = await self._ensure_background_xvfb()
+                kwargs["headless"] = False
+                args = list(LOGIN_BROWSER_ARGS)
+            args.append(f"--profile-directory={selected}")
+            kwargs["args"] = args
+        try:
+            context = await self._playwright.chromium.launch_persistent_context(**kwargs)
+        except Exception:
+            if owns_background_xvfb:
+                await self._stop_background_xvfb()
+            raise
+        if owns_background_xvfb:
+            self._background_xvfb_contexts.add(id(context))
+        return context
+
+    async def _close_context(self, context: BrowserContext) -> None:
+        owns_background_xvfb = id(context) in self._background_xvfb_contexts
+        try:
+            await context.close()
+        finally:
+            self._background_xvfb_contexts.discard(id(context))
+            if owns_background_xvfb:
+                await self._stop_background_xvfb()
 
     async def start(self):
         """启动 Playwright"""
@@ -416,7 +551,7 @@ class BrowserManager:
         """关闭当前浏览器"""
         if self._active_context:
             try:
-                await self._active_context.close()
+                await self._close_context(self._active_context)
             except Exception:
                 pass
             self._active_context = None
@@ -1275,7 +1410,18 @@ class BrowserManager:
             elif not await self._save_google_cookies_from_context(profile["id"], context):
                 result = failure("cookies_incomplete", "Flow/Google 登录 Cookie 不完整，请在源 Profile 完成 Flow 登录")
             else:
-                await self._discover_flow_project_id(profile["id"], context)
+                discovered_project = await self._discover_flow_project_id(
+                    profile["id"], context
+                )
+                trusted_project = self._trusted_flow_project_id(
+                    profile,
+                    result.get("email") or "",
+                    discovered_project,
+                )
+                if trusted_project:
+                    self._flow_project_ids[int(profile["id"])] = trusted_project
+                else:
+                    self._flow_project_ids.pop(int(profile["id"]), None)
         if not result["success"]:
             self._session_errors[profile["id"]] = result
             await self._persist_login_state(profile["id"], None)
@@ -1310,15 +1456,7 @@ class BrowserManager:
         is_logged_in: Optional[bool] = None,
     ) -> None:
         logged_in = bool(token) if is_logged_in is None else bool(is_logged_in)
-        if not logged_in:
-            self._flow_project_ids.pop(int(profile_id), None)
         update_data: Dict[str, Any] = {"is_logged_in": 1 if logged_in else 0}
-        if not logged_in:
-            update_data.update(
-                observed_flow_project_id=None,
-                observed_flow_project_verified=0,
-                observed_flow_project_identity=None,
-            )
         if token:
             update_data["last_token"] = self._mask_token(token)
             update_data["last_token_time"] = datetime.now().isoformat()
@@ -1505,7 +1643,7 @@ class BrowserManager:
             finally:
                 if context:
                     try:
-                        await context.close()
+                        await self._close_context(context)
                     except Exception:
                         pass
 
@@ -1564,7 +1702,7 @@ class BrowserManager:
             finally:
                 if context:
                     try:
-                        await context.close()
+                        await self._close_context(context)
                     except Exception:
                         pass
 
@@ -1714,7 +1852,7 @@ class BrowserManager:
             finally:
                 if context:
                     try:
-                        await context.close()
+                        await self._close_context(context)
                     except Exception:
                         pass
                     logger.info(f"[{profile['name']}] Headless 浏览器已关闭")
@@ -1849,7 +1987,7 @@ class BrowserManager:
                         pass
                 if context:
                     try:
-                        await context.close()
+                        await self._close_context(context)
                     except Exception:
                         pass
                 if use_vnc:
@@ -1887,6 +2025,16 @@ class BrowserManager:
             if not checked["success"]:
                 result = checked
         if not result["success"]:
+            self._session_errors[profile["id"]] = result
+            return None
+        # /auth/session can rotate Google cookies.  Persist only a complete,
+        # already-validated jar; the helper deliberately retains the previous
+        # snapshot on any read/validation failure.
+        if not await self._save_google_cookies_from_context(profile["id"], context):
+            result = failure(
+                "cookies_incomplete",
+                "源浏览器 Cookie 快照不完整；已保留上一次有效快照",
+            )
             self._session_errors[profile["id"]] = result
             return None
         self._session_errors.pop(profile["id"], None)
@@ -1929,7 +2077,7 @@ class BrowserManager:
             finally:
                 if context:
                     try:
-                        await context.close()
+                        await self._close_context(context)
                     except Exception:
                         pass
 

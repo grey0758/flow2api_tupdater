@@ -1,0 +1,3 @@
+services:
+  token-updater:
+    image: flow2api-token-updater-control:id11-browser-context-repair2-20260922

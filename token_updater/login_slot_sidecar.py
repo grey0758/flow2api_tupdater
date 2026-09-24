@@ -35,19 +35,21 @@ COOKIE_NAME = "flow_login_slot3"
 BASE = "/login-slot3"
 NOVNC_ROOT = Path("/usr/share/novnc").resolve()
 ADMIN_TOKEN = os.getenv("LOGIN_SLOT3_ADMIN_TOKEN", "")
+RECOVER_EXISTING = os.getenv("LOGIN_SLOT3_RECOVER_EXISTING", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
 
 HTML = """<!doctype html>
 <html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"referrer\" content=\"no-referrer\"><title>Flow 登录槽位 3</title>
-<style>body{font:16px system-ui;margin:0;background:#101827;color:#fff}header{padding:12px 18px;line-height:1.5}button{padding:10px 16px;cursor:pointer;margin-left:8px}iframe{border:0;width:100vw;height:calc(100vh - 100px)}.hidden{display:none}</style></head>
-<body><header><strong id=\"title\">正在准备专属浏览器…</strong><span id=\"instructions\" class=\"hidden\">只在下方浏览器完成 Google、Flow 和 Labs 授权；不要导出 Cookie。<button id=\"done\">我已完成登录</button></span><span id=\"status\"></span></header>
+<style>body{font:16px system-ui;margin:0;background:#101827;color:#fff}header{padding:12px 18px;line-height:1.5}iframe{border:0;width:100vw;height:calc(100vh - 100px)}.hidden{display:none}</style></head>
+<body><header><strong id=\"title\">正在准备专属浏览器…</strong><span id=\"instructions\" class=\"hidden\">只在下方浏览器完成 Google、Flow 和 Labs 授权；不要导出 Cookie。完成后保持页面打开，管理员会直接检查，无需点击确认。</span><span id=\"status\"></span></header>
 <iframe id=\"vnc\" class=\"hidden\" title=\"专属 VNC\"></iframe><script src=\"/login-slot3/client.js\"></script></body></html>"""
 
-JS = """const title=document.getElementById('title'),instructions=document.getElementById('instructions'),status=document.getElementById('status'),frame=document.getElementById('vnc'),done=document.getElementById('done');let waiting=false;
+JS = """const title=document.getElementById('title'),instructions=document.getElementById('instructions'),status=document.getElementById('status'),frame=document.getElementById('vnc');
 async function json(path,opt={}){const r=await fetch(path,{...opt,headers:{'Content-Type':'application/json',...(opt.headers||{})}});const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.detail||'登录槽位不可用');return d}
 async function init(){let s;const capability=decodeURIComponent(location.hash.slice(1));if(capability){history.replaceState(null,'','/login-slot3/');s=await json('/login-slot3/claim',{method:'POST',body:JSON.stringify({capability})})}else{s=await json('/login-slot3/session')}title.textContent='独立登录槽位 3';instructions.classList.remove('hidden');frame.src='/login-slot3/vnc/vnc.html?autoconnect=1&resize=scale&path='+encodeURIComponent('login-slot3/vnc/websockify');frame.classList.remove('hidden')}
-done.onclick=async()=>{done.disabled=true;try{await json('/login-slot3/complete',{method:'POST'});waiting=true;status.textContent=' 已通知管理员；请保留本页。'}catch(e){done.disabled=false;status.textContent=' '+e.message}}
-setInterval(async()=>{if(!waiting)return;try{const s=await json('/login-slot3/session');if(s.state==='ready'){waiting=false;done.disabled=false;status.textContent=' 检查尚未通过，请在同一桌面补完 Flow/Labs 步骤后再次提交。'}}catch(_){waiting=false;frame.remove();status.textContent=' 登录桌面已由管理员关闭；请等待后续验收。'}},5000);init().catch(e=>{title.textContent=e.message;status.textContent=' 请联系管理员。'});"""
+setInterval(async()=>{try{const s=await json('/login-slot3/session');status.textContent=s.state==='checking'?' 管理员正在执行无成本检查，请暂时不要操作。':' 完成可见授权后保持本页打开；管理员会直接检查。'}catch(_){frame.remove();status.textContent=' 登录桌面已由管理员关闭；请等待后续验收。'}},5000);init().catch(e=>{title.textContent=e.message;status.textContent=' 请联系管理员。'});"""
 
 
 class Sidecar:
@@ -64,6 +66,7 @@ class Sidecar:
         self.last_error = ""
         self.identity = ""
         self.project_id = ""
+        self.existing_project_present = False
         self.expiry_task: asyncio.Task | None = None
 
     def _headers(self, method: str, path: str, body: bytes = b"") -> dict[str, str]:
@@ -96,7 +99,8 @@ class Sidecar:
                 await asyncio.sleep(0.5)
             if not Path(WORKER_SOCKET).exists():
                 raise RuntimeError("worker socket unavailable")
-            result = await self.worker_call("assign", {"proxy_url": "http://127.0.0.1:18088"}, timeout=120)
+            operation = "recover" if RECOVER_EXISTING else "assign"
+            result = await self.worker_call(operation, {"proxy_url": "http://127.0.0.1:18088"}, timeout=120)
             if result.get("state") != "ready" or not result.get("browser_running"):
                 raise RuntimeError("worker did not confirm browser readiness")
             self.state = "ready"
@@ -163,18 +167,21 @@ class Sidecar:
         if not self._session_ok(request):
             raise HTTPException(401, "登录会话不存在或已过期")
 
-    async def validate(self) -> dict:
+    async def validate(self, expected_existing_project_id: str = "") -> dict:
         # Serialize the whole same-context check against every inbound RFB
         # input frame.  The worker also stops x11vnc before reading Cookies and
         # provider responses, but this gate prevents a queued owner action
         # from racing the transition into that state.
         async with self.input_gate:
             async with self.lock:
-                if self.state != "awaiting_check":
-                    raise HTTPException(409, "先由 owner 提交完成登录")
+                if self.state not in {"ready", "awaiting_check"}:
+                    raise HTTPException(409, "登录槽位当前不能执行管理员检查")
                 self.state = "checking"
             try:
-                result = await self.worker_call("validate", timeout=120)
+                payload = {}
+                if expected_existing_project_id:
+                    payload["expected_existing_project_id"] = expected_existing_project_id
+                result = await self.worker_call("validate", payload, timeout=180)
                 accepted = bool(result.get("success") and result.get("is_logged_in")
                                 and result.get("has_flow_project") and result.get("state") == "validated")
                 async with self.lock:
@@ -189,10 +196,39 @@ class Sidecar:
                             self.identity = ""
                             self.project_id = ""
                             accepted = False
-                return {"success": accepted, "state": self.state,
-                        "has_identity": bool(self.identity),
-                        "has_project": bool(self.project_id),
-                        "error_code": self.last_error or None}
+                response = {
+                    "success": accepted,
+                    "state": self.state,
+                    "has_identity": bool(self.identity),
+                    "has_project": bool(self.project_id),
+                    "error_code": self.last_error or None,
+                }
+                if not accepted:
+                    # Expose only bounded classifier telemetry needed to
+                    # distinguish an absent provider response from a changed
+                    # response shape.  Never pass through payloads, URLs,
+                    # identity, project identifiers, or browser state.
+                    allowed_counts = {
+                        "flow_rpc_post", "rpc_ids_known", "rpc_ids_other",
+                        "known_status_200", "known_content_type",
+                        "known_success_envelope", "scoped_candidate_match",
+                        "user_list_candidate_match",
+                    }
+                    raw_counts = result.get("probe_counts")
+                    if isinstance(raw_counts, dict):
+                        safe_counts = {}
+                        for key in allowed_counts:
+                            value = raw_counts.get(key)
+                            if isinstance(value, int) and not isinstance(value, bool):
+                                safe_counts[key] = max(0, min(999, value))
+                        if safe_counts:
+                            response["probe_counts"] = safe_counts
+                    candidate_count = result.get("candidate_count")
+                    if isinstance(candidate_count, int) and not isinstance(candidate_count, bool):
+                        response["candidate_count"] = max(0, min(99, candidate_count))
+                    if isinstance(result.get("candidate_visible"), bool):
+                        response["candidate_visible"] = result["candidate_visible"]
+                return response
             except Exception as exc:
                 async with self.lock:
                     self.state = "quarantined"
@@ -221,7 +257,30 @@ class Sidecar:
             return {"identity": self.identity, "project_id": self.project_id,
                     "profile_id": PROFILE_ID, "generation": self.generation}
 
+    async def account_handoff(self) -> dict:
+        """Return only the account identity for existing-token recovery.
+
+        The account-project validation branch proves that the authenticated
+        account owns projects, but deliberately does not select or export one
+        of their identifiers.  The caller keeps the existing token's database-
+        bound project and needs only the validated identity plus slot scope to
+        prevent a cross-profile handoff.
+        """
+        async with self.lock:
+            if not RECOVER_EXISTING:
+                raise HTTPException(409, "account handoff is recovery-only")
+            if (self.state != "validated" or not self.identity
+                    or not self.existing_project_present):
+                raise HTTPException(409, "validated account handoff evidence is unavailable")
+            return {
+                "identity": self.identity,
+                "profile_id": PROFILE_ID,
+                "generation": self.generation,
+            }
+
     async def cleanup(self) -> dict:
+        if RECOVER_EXISTING:
+            raise HTTPException(409, "existing Profile cleanup is forbidden")
         async with self.lock:
             if self.state != "validated":
                 raise HTTPException(409, "slot is not ready for post-handoff cleanup")
@@ -238,6 +297,53 @@ class Sidecar:
                 self.identity = ""
                 self.project_id = ""
         return self.public()
+
+    async def validate_account_projects(self, expected_existing_project_id: str) -> dict:
+        async with self.input_gate:
+            async with self.lock:
+                if self.state not in {"ready", "awaiting_check"}:
+                    raise HTTPException(409, "登录槽位当前不能执行管理员检查")
+                self.state = "checking"
+            try:
+                result = await self.worker_call(
+                    "validate-account-projects",
+                    {"expected_existing_project_id": expected_existing_project_id},
+                    timeout=180,
+                )
+                accepted = bool(
+                    result.get("success")
+                    and result.get("is_logged_in")
+                    and result.get("has_account_projects")
+                    and result.get("state") == "validated"
+                )
+                async with self.lock:
+                    self.state = "validated" if accepted else "ready"
+                    self.last_error = "" if accepted else str(
+                        result.get("error_code") or "validation_failed"
+                    )[:64]
+                    self.identity = str(result.get("identity") or "").strip().lower() if accepted else ""
+                    self.project_id = ""
+                    self.existing_project_present = bool(
+                        accepted and result.get("existing_project_present")
+                    )
+                    if accepted and (not self.identity or "@" not in self.identity):
+                        self.state = "quarantined"
+                        self.last_error = "incomplete_handoff_evidence"
+                        self.identity = ""
+                        accepted = False
+                return {
+                    "success": accepted,
+                    "state": self.state,
+                    "has_identity": bool(self.identity),
+                    "has_account_projects": bool(result.get("has_account_projects")),
+                    "existing_project_present": bool(result.get("existing_project_present")),
+                    "error_code": self.last_error or None,
+                }
+            except Exception as exc:
+                async with self.lock:
+                    self.state = "quarantined"
+                    self.last_error = type(exc).__name__
+                return {"success": False, "state": self.state, "error_code": self.last_error}
 
 
 sidecar = Sidecar()
@@ -409,6 +515,32 @@ async def admin_validate(request: Request):
     return await sidecar.validate()
 
 
+@app.post("/__slot3_admin/validate-existing")
+async def admin_validate_existing(request: Request):
+    _admin(request)
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(400, "invalid request") from exc
+    expected = str(payload.get("expected_existing_project_id") or "").strip()
+    if not expected:
+        raise HTTPException(400, "existing project is required")
+    return await sidecar.validate(expected)
+
+
+@app.post("/__slot3_admin/validate-account-projects")
+async def admin_validate_account_projects(request: Request):
+    _admin(request)
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(400, "invalid request") from exc
+    expected = str(payload.get("expected_existing_project_id") or "").strip()
+    if not expected:
+        raise HTTPException(400, "existing project is required")
+    return await sidecar.validate_account_projects(expected)
+
+
 @app.post("/__slot3_admin/abort")
 async def admin_abort(request: Request):
     _admin(request)
@@ -419,6 +551,12 @@ async def admin_abort(request: Request):
 async def admin_handoff(request: Request):
     _admin(request)
     return await sidecar.handoff()
+
+
+@app.get("/__slot3_admin/account-handoff")
+async def admin_account_handoff(request: Request):
+    _admin(request)
+    return await sidecar.account_handoff()
 
 
 @app.post("/__slot3_admin/cleanup")

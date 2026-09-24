@@ -85,7 +85,7 @@ def _is_fresh_login_slot_profile(profile: Dict[str, Any]) -> bool:
         "last_check_result", "last_sync_time", "last_sync_result",
         "login_account", "login_password", "login_method", "google_cookies",
         "observed_flow_project_id", "observed_flow_project_identity",
-        "flow2api_url", "connection_token_override",
+        "flow2api_url", "connection_token_override", "login_slot_generation",
     )
     return bool(profile.get("login_slot_prepared")) and not any(
         (
@@ -856,6 +856,25 @@ async def start_login_slot(profile_id: int, token: str = Depends(verify_session)
         raise HTTPException(503, "登录槽位启动失败，请管理员检查服务状态")
     return {
         "slot": slot.number, "profile_id": profile_id,
+        "invite_url": f"/login-slots#{slot.capability}",
+        "expires_at": slot.expires_at,
+    }
+
+
+@app.post("/api/login-slots/{number}/recover/{profile_id}")
+async def recover_login_slot(number: int, profile_id: int, token: str = Depends(verify_session)):
+    profile = await profile_db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(404, "Profile 不存在")
+    try:
+        slot = await login_slots.recover(profile, number)
+    except LoginSlotError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    except Exception:
+        logger.exception("隔离槽位续接失败（不记录浏览器数据）")
+        raise HTTPException(503, "原槽位恢复失败，数据仍隔离")
+    return {
+        "slot": slot.number, "profile_id": slot.profile_id,
         "invite_url": f"/login-slots#{slot.capability}",
         "expires_at": slot.expires_at,
     }

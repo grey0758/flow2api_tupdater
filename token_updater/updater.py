@@ -2,7 +2,7 @@
 import asyncio
 import json
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
@@ -52,6 +52,22 @@ class TokenSyncer:
             return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo is not None else parsed
         except ValueError:
             return None
+
+    @staticmethod
+    def _parse_expiry(value: Any) -> Optional[datetime]:
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _expiry_is_usable(self, value: Any) -> bool:
+        parsed = self._parse_expiry(value)
+        return bool(parsed and parsed > datetime.now(timezone.utc))
 
     async def _extract_token_with_timeout(self, profile: Dict[str, Any]) -> Optional[str]:
         profile_id = int(profile["id"])
@@ -117,6 +133,12 @@ class TokenSyncer:
 
         if not token_info.get("is_active", True):
             return True, "目标端 Token 已失活"
+
+        if token_info.get("project_owned") is False:
+            return False, "目标端当前项目归属无效，需要管理员修复"
+
+        if not self._expiry_is_usable(token_info.get("at_expires")):
+            return True, "目标端会话已过期或有效期无法确认"
 
         if token_info.get("needs_refresh"):
             return True, "目标端判定需要刷新"
@@ -255,6 +277,81 @@ class TokenSyncer:
                 }
         except Exception:
             return failure("destination_unavailable", "目标状态查询失败，请检查服务地址、网络连接或稍后重试")
+
+    async def _verify_destination_session(
+        self,
+        flow2api_url: str,
+        connection_token: str,
+        *,
+        expected_email: str,
+        expected_project_id: str,
+        pushed: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Require one exact, usable destination readback after a write."""
+        normalized_email = self._normalize_email(expected_email)
+        normalized_project = self._normalize_project_id(expected_project_id)
+        expected_token_id = pushed.get("token_id")
+        if not normalized_email or not normalized_project or not isinstance(expected_token_id, int):
+            return {
+                **failure(
+                    "destination_contract_incomplete",
+                    "目标写入响应缺少稳定身份、Token 或项目契约；已停止自动重试",
+                ),
+                "synced": True,
+            }
+
+        checked = await self._check_tokens_status(
+            flow2api_url,
+            connection_token,
+            [normalized_email],
+        )
+        if not checked.get("success"):
+            return {
+                **failure(
+                    "destination_readback_unavailable",
+                    "目标写入后状态读回失败；Profile 已暂停，确认目标状态前不要重试同步",
+                ),
+                "synced": True,
+            }
+        matches = [
+            token for token in checked.get("tokens", [])
+            if self._normalize_email(token.get("email")) == normalized_email
+        ]
+        if len(matches) != 1:
+            return {
+                **failure(
+                    "destination_identity_ambiguous",
+                    "目标写入后身份记录不唯一；Profile 已暂停",
+                ),
+                "synced": True,
+            }
+        token = matches[0]
+        actual_project = self._normalize_project_id(token.get("current_project_id"))
+        expected_active = pushed.get("account_active")
+        if not (
+            token.get("id") == expected_token_id
+            and actual_project == normalized_project
+            and token.get("project_owned") is True
+            and self._expiry_is_usable(token.get("at_expires"))
+            and token.get("needs_refresh") is False
+            and isinstance(expected_active, bool)
+            and token.get("is_active") is expected_active
+        ):
+            return {
+                **failure(
+                    "destination_session_unusable",
+                    "目标写入后 Token、项目、启用状态或真实会话有效期未通过读回；Profile 已暂停",
+                ),
+                "synced": True,
+            }
+        return {
+            "success": True,
+            "token_id": expected_token_id,
+            "current_project_id": actual_project,
+            "at_expires": token.get("at_expires"),
+            "project_owned": True,
+            "needs_refresh": False,
+        }
 
     async def sync_profile(self, profile_id: int, *, source: str = "manual") -> Dict[str, Any]:
         from .login_slots import login_slots
@@ -437,20 +534,49 @@ class TokenSyncer:
                 )
                 if not pushed.get("success"):
                     return pushed
-                if not (
+                common_ack = bool(
                     pushed.get("oauth_verified") is True
                     and pushed.get("project_context_accepted") is True
-                    and pushed.get("project_reused") is True
-                    and pushed.get("pending_enable") is True
-                    and pushed.get("account_active") is False
-                    and pushed.get("action") == "added_pending_enable"
+                    and pushed.get("project_owned") is True
                     and returned_identity
                     and returned_identity == expected_identity
-                ):
-                    return failure(
-                        "onboarding_acknowledgement_mismatch",
-                        "目标未完整确认同一身份、项目复用及待启用状态；禁止计为同步成功",
+                )
+                if pushed.get("action") == "added_pending_enable":
+                    action_ack = bool(
+                        pushed.get("project_reused") is True
+                        and pushed.get("pending_enable") is True
+                        and pushed.get("account_active") is False
                     )
+                elif pushed.get("action") == "updated":
+                    action_ack = bool(
+                        pushed.get("pending_enable") is False
+                        and pushed.get("account_active") is True
+                    )
+                else:
+                    action_ack = False
+                if not (common_ack and action_ack):
+                    return {
+                        **failure(
+                            "onboarding_acknowledgement_mismatch",
+                            "目标未按新增或既有账号分支完整确认身份、项目及启用状态；禁止计为同步成功",
+                        ),
+                        "synced": True,
+                    }
+            if not pushed.get("success"):
+                return pushed
+            expected_email = self._normalize_email(
+                pushed.get("email") or fresh_profile.get("email") or ""
+            )
+            readback = await self._verify_destination_session(
+                flow2api_url,
+                connection_token,
+                expected_email=expected_email,
+                expected_project_id=project_id or "",
+                pushed=pushed,
+            )
+            if not readback.get("success"):
+                return readback
+            pushed.update(readback)
             return pushed
 
         result = await push_current_session()
@@ -490,12 +616,14 @@ class TokenSyncer:
             )
         else:
             error_result = f"failed: {result.get('error', 'unknown')}"
+            fail_closed_fields = {"is_active": 0} if result.get("synced") else {}
             await self._update_profile_check_result(
                 profile_id,
                 error_result,
                 last_sync_time=datetime.now().isoformat(),
                 last_sync_result=error_result,
                 error_count=profile.get("error_count", 0) + 1,
+                **fail_closed_fields,
             )
             self._total_error_count += 1
             logger.error(f"[{profile['name']}] 同步失败: {result.get('error')}")
@@ -761,16 +889,31 @@ class TokenSyncer:
                 if not isinstance(data, dict) or data.get("success") is not True:
                     return {"success": False, "error": "Flow2API did not acknowledge the session update"}
                 if google_cookies is not None and (data.get("cookies_updated") is not True or data.get("flow_cookies_configured") is not True or data.get("google_session_cookies_configured") is not True):
-                    return {"success": False, "error": "Flow cookie synchronization was not confirmed; upgrade Flow2API and refresh the source profile"}
+                    return {**failure(
+                        "cookie_sync_unconfirmed",
+                        "Flow cookie synchronization was not confirmed; upgrade Flow2API and inspect destination state before retrying",
+                    ), "synced": True}
                 if google_cookies is not None and data.get("proxy_configured") is not True:
-                    return {"success": False, "error": "目标账号未绑定代理，请配置目标 Flow2API 可访问的同出口代理地址"}
+                    return {**failure(
+                        "destination_proxy",
+                        "目标账号未绑定代理；写入状态需人工核对，禁止自动重试",
+                    ), "synced": True}
                 if captcha_proxy_url and (data.get("proxy_updated") is not True or data.get("proxy_configured") is not True):
-                    return {"success": False, "error": "Flow2API did not acknowledge the destination proxy binding"}
+                    return {**failure(
+                        "destination_proxy",
+                        "Flow2API did not acknowledge the destination proxy binding; inspect destination state before retrying",
+                    ), "synced": True}
                 if normalized_project_id and data.get("project_context_accepted") is not True:
-                    return failure("project_context_unconfirmed", "目标未确认复用源浏览器 Flow 项目；请升级目标服务")
+                    return {
+                        **failure("project_context_unconfirmed", "目标未确认复用源浏览器 Flow 项目；请升级目标服务"),
+                        "synced": True,
+                    }
                 if google_cookies is not None:
                     if data.get("oauth_verified") is not True:
-                        return failure("oauth_unconfirmed", "目标未确认 Labs 实际鉴权，请先升级 Flow2API；不能将已接收视为已恢复")
+                        return {
+                            **failure("oauth_unconfirmed", "目标未确认 Labs 实际鉴权，请先升级 Flow2API；不能将已接收视为已恢复"),
+                            "synced": True,
+                        }
                     if data.get("native_session_verified") is False:
                         return {**failure("native_session_unverified", "会话已保存且 OAuth 有效，但目标 Flow 项目登录预检失败；不要以生成任务反复验证登录态"),
                                 "synced": True, "oauth_verified": True, "native_session_verified": False}
@@ -783,10 +926,33 @@ class TokenSyncer:
                         return {**failure("account_disabled", "会话已保存并通过鉴权，但目标账号仍禁用；请检查目标手动禁用状态或自动启用设置"),
                                 "synced": True, "account_active": data.get("account_active"), "oauth_verified": True}
                     if data.get("account_active") is not True and not pending_enable:
-                        return failure("activation_unconfirmed", "目标未确认账号启用状态，请升级目标服务并检查账号状态")
+                        return {
+                            **failure("activation_unconfirmed", "目标未确认账号启用状态，请升级目标服务并检查账号状态"),
+                            "synced": True,
+                        }
+                    token_id = data.get("token_id")
+                    current_project_id = self._normalize_project_id(
+                        data.get("current_project_id")
+                    )
+                    if not (
+                        isinstance(token_id, int)
+                        and token_id > 0
+                        and normalized_project_id
+                        and current_project_id == normalized_project_id
+                        and data.get("project_owned") is True
+                        and self._expiry_is_usable(data.get("at_expires"))
+                        and data.get("needs_refresh") is False
+                    ):
+                        return {
+                            **failure(
+                                "destination_contract_incomplete",
+                                "目标未确认唯一 Token、稳定项目归属或未来有效会话；已停止自动重试",
+                            ),
+                            "synced": True,
+                        }
                 message = data.get("message", "")
-                email = None
-                if " for " in message:
+                email = self._normalize_email(data.get("email") or "") or None
+                if not email and " for " in message:
                     email = message.split(" for ")[-1]
 
                 return {
@@ -800,6 +966,11 @@ class TokenSyncer:
                         "pending_enable": data.get("pending_enable") is True,
                         "project_context_accepted": data.get("project_context_accepted") is True,
                         "project_reused": data.get("project_reused") is True,
+                        "token_id": data.get("token_id"),
+                        "current_project_id": data.get("current_project_id"),
+                        "project_owned": data.get("project_owned") is True,
+                        "at_expires": data.get("at_expires"),
+                        "needs_refresh": data.get("needs_refresh") is True,
                     } if google_cookies is not None else {}),
                 }
         except Exception:

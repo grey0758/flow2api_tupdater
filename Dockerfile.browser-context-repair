@@ -1,0 +1,7 @@
+ARG BASE_IMAGE=sha256:a74b42d14b3b34d4f20ae0dc60f7faf6ef908b4a6abaf62c9eb950d604684a25
+FROM ${BASE_IMAGE}
+
+# Keep the accepted production image intact and replace only the reviewed
+# browser-context selector/lifecycle implementation.
+COPY token_updater/browser.py /app/token_updater/browser.py
+RUN chmod 0644 /app/token_updater/browser.py

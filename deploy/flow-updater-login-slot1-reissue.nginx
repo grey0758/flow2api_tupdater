@@ -1,0 +1,33 @@
+# Temporary Profile14/slot1 invitation plane.  It inherits the vhost's Basic
+# Auth and exposes no administration route.  The sidecar has no TCP listener.
+location = /login-slot1-reissue {
+    return 307 /login-slot1-reissue/;
+}
+
+location = /login-slot1-reissue/vnc/websockify {
+    proxy_pass http://unix:/run/flow2api-login-slots/sidecar1-reissue/sidecar.sock:;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+    proxy_buffering off;
+}
+
+location ^~ /login-slot1-reissue/ {
+    proxy_pass http://unix:/run/flow2api-login-slots/sidecar1-reissue/sidecar.sock:;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header Connection "";
+    proxy_connect_timeout 15s;
+    proxy_send_timeout 3600s;
+    proxy_read_timeout 3600s;
+    proxy_request_buffering off;
+    proxy_buffering off;
+    client_max_body_size 64k;
+}

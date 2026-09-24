@@ -1,0 +1,15 @@
+ARG BASE_IMAGE=sha256:397d156f4644b1e71225a04776b5a8041f5ce3f5b89ef455ed51788144a6c6fa
+FROM ${BASE_IMAGE}
+
+# Preserve the accepted production filesystem and replace only the reviewed
+# browser/session, receiver-contract, slot-restart and schema implementation.
+COPY repos/flow2api-tupdater/token_updater/browser.py /app/token_updater/browser.py
+COPY repos/flow2api-tupdater/token_updater/database.py /app/token_updater/database.py
+COPY repos/flow2api-tupdater/token_updater/login_slots.py /app/token_updater/login_slots.py
+COPY repos/flow2api-tupdater/token_updater/updater.py /app/token_updater/updater.py
+
+RUN chmod 0644 \
+    /app/token_updater/browser.py \
+    /app/token_updater/database.py \
+    /app/token_updater/login_slots.py \
+    /app/token_updater/updater.py

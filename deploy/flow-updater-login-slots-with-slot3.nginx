@@ -45,3 +45,6 @@ location ^~ /login-slot3/ {
     proxy_buffering off;
     client_max_body_size 64k;
 }
+
+include /etc/nginx/snippets/flow-updater-login-slot1-reissue.conf;
+include /etc/nginx/snippets/flow-updater-login-slot2-reissue.conf;

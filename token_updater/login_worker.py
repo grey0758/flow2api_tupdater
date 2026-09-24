@@ -20,7 +20,7 @@ import struct
 import subprocess
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote_plus, urlparse
 from uuid import UUID
 
 import uvicorn
@@ -69,6 +69,71 @@ LOGIN_BROWSER_ARGS = [
 ]
 
 PROJECT_API_PATH = re.compile(r"^/fx/api/trpc/project\.[A-Za-z0-9_.-]+$")
+PROJECT_DOCUMENT_PATH = re.compile(
+    r"^/(?:project|projects)/"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/?$"
+)
+MODERN_FLOW_HOME_URL = "https://flow.google.com/"
+MODERN_USER_PROJECT_RPC_IDS = frozenset({
+    # Current Angular homepage project query paths. SearchUserProjects is the
+    # active semantic path; GetProjects is its feature-flagged legacy path.
+    "OylIJd",  # /AiSandbox.SearchUserProjects
+    "UpteDb",  # /FlowService.GetProjects
+})
+MODERN_PROJECT_SCOPED_RPC_IDS = frozenset({
+    "rEhmZd",  # /FlowService.ListCollections
+    "Zzl0ze",  # /FlowService.GetProjectContents
+    "bOKtO",  # /FlowService.ListMedia
+    "ncZTKe",  # /FlowService.ListSceneWorkflows
+    "Xffewf",  # /FlowService.ListScenes
+    "kGwJ9b",  # /FlowService.ListWorkflows
+    "GI4k8",  # /AiSandbox.SearchProjectScenes
+    "SIzNd",  # /AiSandbox.SearchProjectWorkflows
+    "ngNC2",  # /AiSandbox.GetProject
+})
+UUID_TEXT_PATTERN = re.compile(
+    r"(?<![0-9A-Fa-f])"
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+    r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+    r"(?![0-9A-Fa-f])"
+)
+PROJECT_DENIAL_MARKERS = (
+    "access denied",
+    "request access",
+    "you don't have access",
+    "you do not have access",
+    "project not found",
+    "doesn't exist",
+    "try signing in with a different account",
+    "unsupported country",
+    "country/region is not supported",
+    "country or region is not supported",
+    "sign in with google",
+    "无权访问",
+    "请求访问权限",
+    "项目不存在",
+    "换一个账号",
+    "所在国家/地区暂不支持",
+)
+PROJECT_EDITOR_MARKERS = (
+    "create with flow",
+    "scenebuilder",
+    "frames to video",
+    "ingredients to video",
+    "text to video",
+    "start creating or drop media",
+)
+PROJECT_MEDIA_WORKSPACE_MARKERS = (
+    "all media",
+    "characters",
+    "scenes",
+    "uploads",
+)
+PROJECT_MEDIA_WORKSPACE_PROMPTS = (
+    "what would you like to create?",
+    "what do you want to create?",
+)
 
 
 def _project_id_from_url(value: Any) -> str | None:
@@ -124,6 +189,18 @@ class LoginWorker:
         self.profile_id = 0
         self.proxy_url = ""
         self.provider_project_ids: set[str] = set()
+        self.accessible_document_ids: set[str] = set()
+        self.validation_candidate_ids: set[str] = set()
+        self.project_probe_counts: dict[str, int] = {}
+        self.project_probe_rpc_ids: set[str] = set()
+
+    def _probe_count(self, key: str) -> None:
+        if key in {
+            "flow_rpc_post", "rpc_ids_known", "rpc_ids_other",
+            "known_status_200", "known_content_type", "known_success_envelope",
+            "scoped_candidate_match", "user_list_candidate_match",
+        }:
+            self.project_probe_counts[key] = min(999, self.project_probe_counts.get(key, 0) + 1)
 
     @staticmethod
     def _safe_profile_dir() -> Path:
@@ -267,19 +344,162 @@ class LoginWorker:
         try:
             parsed = urlparse(response.url)
             content_type = (await response.header_value("content-type") or "").lower()
+            rpc_ids = {
+                rpc_id
+                for value in parse_qs(parsed.query).get("rpcids", [])
+                for rpc_id in value.split(",")
+                if rpc_id
+            }
             if (
-                response.request.method != "GET"
-                or parsed.scheme != "https"
-                or parsed.hostname != "labs.google"
-                or not PROJECT_API_PATH.fullmatch(parsed.path)
-                or response.status != 200
-                or "json" not in content_type
+                parsed.scheme == "https"
+                and parsed.hostname == "flow.google.com"
+                and parsed.path.endswith("/data/batchexecute")
+                and response.request.method == "POST"
             ):
+                self._probe_count("flow_rpc_post")
+                self.project_probe_rpc_ids.update(
+                    item for item in rpc_ids
+                    if len(item) <= 12 and re.fullmatch(r"[A-Za-z0-9_-]+", item)
+                )
+                if rpc_ids & (MODERN_USER_PROJECT_RPC_IDS | MODERN_PROJECT_SCOPED_RPC_IDS):
+                    self._probe_count("rpc_ids_known")
+                    if response.status == 200:
+                        self._probe_count("known_status_200")
+                        if "json" in content_type or "text/plain" in content_type:
+                            self._probe_count("known_content_type")
+                else:
+                    self._probe_count("rpc_ids_other")
+            is_legacy_api = (
+                response.request.method == "GET"
+                and parsed.scheme == "https"
+                and parsed.hostname == "labs.google"
+                and PROJECT_API_PATH.fullmatch(parsed.path) is not None
+                and response.status == 200
+                and "json" in content_type
+            )
+            is_modern_document = (
+                response.request.method == "GET"
+                and response.request.resource_type == "document"
+                and parsed.scheme == "https"
+                and parsed.hostname == "flow.google.com"
+                and PROJECT_DOCUMENT_PATH.fullmatch(parsed.path) is not None
+                and response.status == 200
+                and "text/html" in content_type
+            )
+            is_modern_user_project_list = (
+                response.request.method == "POST"
+                and parsed.scheme == "https"
+                and parsed.hostname == "flow.google.com"
+                and parsed.path.endswith("/data/batchexecute")
+                and bool(rpc_ids & MODERN_USER_PROJECT_RPC_IDS)
+                and response.status == 200
+                and ("json" in content_type or "text/plain" in content_type)
+            )
+            is_modern_project_scoped_read = (
+                response.request.method == "POST"
+                and parsed.scheme == "https"
+                and parsed.hostname == "flow.google.com"
+                and parsed.path.endswith("/data/batchexecute")
+                and bool(rpc_ids & MODERN_PROJECT_SCOPED_RPC_IDS)
+                and response.status == 200
+                and ("json" in content_type or "text/plain" in content_type)
+            )
+            if not any((
+                is_legacy_api,
+                is_modern_document,
+                is_modern_user_project_list,
+                is_modern_project_scoped_read,
+            )):
                 return
-            payload = await response.json()
-            self.provider_project_ids.update(_uuid_values(payload))
+            if is_legacy_api:
+                payload = await response.json()
+                self.provider_project_ids.update(_uuid_values(payload))
+                return
+            if is_modern_user_project_list or is_modern_project_scoped_read:
+                document = await response.text()
+                permitted_ids = (
+                    MODERN_USER_PROJECT_RPC_IDS
+                    if is_modern_user_project_list
+                    else MODERN_PROJECT_SCOPED_RPC_IDS
+                )
+                successful_rpc_ids = {
+                    rpc_id for rpc_id in rpc_ids & permitted_ids
+                    if re.search(
+                        rf'\[\s*"wrb\.fr"\s*,\s*"{re.escape(rpc_id)}"',
+                        document,
+                    )
+                }
+                if not successful_rpc_ids:
+                    return
+                self._probe_count("known_success_envelope")
+                if is_modern_user_project_list:
+                    matched_ids = {
+                        str(UUID(match.group(0)))
+                        for match in UUID_TEXT_PATTERN.finditer(document)
+                    }
+                    if matched_ids & self.validation_candidate_ids:
+                        self._probe_count("user_list_candidate_match")
+                    self.provider_project_ids.update(matched_ids)
+                else:
+                    request_body = unquote_plus(
+                        str(getattr(response.request, "post_data", "") or "")
+                    )
+                    request_ids = {
+                        str(UUID(match.group(0)))
+                        for match in UUID_TEXT_PATTERN.finditer(request_body)
+                    }
+                    matched_ids = request_ids & self.validation_candidate_ids
+                    if matched_ids:
+                        self._probe_count("scoped_candidate_match")
+                    self.provider_project_ids.update(matched_ids)
+                return
+            project_id = _project_id_from_url(response.url)
+            if not project_id:
+                return
+            document = (await response.text()).lower()
+            if any(marker in document for marker in PROJECT_DENIAL_MARKERS):
+                return
+            # A modern SPA document can be a generic HTTP 200 shell.  It
+            # establishes a candidate for the visible-access check below,
+            # but is not an account-bound provider ownership assertion.
+            self.accessible_document_ids.add(project_id)
         except Exception:
             return
+
+    async def _project_page_is_accessible(self, project_id: str) -> bool:
+        """Require the same context to render the exact project without denial UI."""
+        if self.context is None:
+            return False
+        for page in list(self.context.pages or []):
+            if _project_id_from_url(getattr(page, "url", "")) != project_id:
+                continue
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                for _ in range(40):
+                    if _project_id_from_url(getattr(page, "url", "")) != project_id:
+                        break
+                    body = (
+                        await page.locator("body").inner_text(timeout=10000)
+                    ).strip().lower()
+                    normalized_body = " ".join(body.split())
+                    if any(marker in body for marker in PROJECT_DENIAL_MARKERS):
+                        break
+                    has_editor = any(
+                        marker in body for marker in PROJECT_EDITOR_MARKERS
+                    )
+                    has_media_workspace = all(
+                        marker in normalized_body
+                        for marker in PROJECT_MEDIA_WORKSPACE_MARKERS
+                    ) and any(
+                        prompt in normalized_body
+                        for prompt in PROJECT_MEDIA_WORKSPACE_PROMPTS
+                    )
+                    if has_editor or has_media_workspace:
+                        return True
+                    await asyncio.sleep(0.5)
+            except Exception:
+                continue
+        return False
 
     @staticmethod
     def _normalize_email(value: Any) -> str:
@@ -364,10 +584,73 @@ class LoginWorker:
             ],
         )
         self.context.on("response", self._record_provider_project_response)
-        flow_page = self.context.pages[0] if self.context.pages else await self.context.new_page()
-        await flow_page.goto(FLOW_URL, wait_until="domcontentloaded", timeout=90000)
-        labs_page = await self.context.new_page()
-        await labs_page.goto(LABS_AUTH_URL, wait_until="domcontentloaded", timeout=90000)
+        pages = list(self.context.pages)
+        # A recovered browser may already be inside its own Flow project.
+        # Preserve that tab; its current authenticated document is reloaded
+        # during validation to prove ownership against the current identity.
+        if not any(_project_id_from_url(getattr(page, "url", "")) for page in pages):
+            flow_page = pages[0] if pages else await self.context.new_page()
+            await flow_page.goto(FLOW_URL, wait_until="domcontentloaded", timeout=90000)
+        if not any(
+            urlparse(getattr(page, "url", "")).hostname == "labs.google"
+            for page in self.context.pages
+        ):
+            labs_page = await self.context.new_page()
+            await labs_page.goto(LABS_AUTH_URL, wait_until="domcontentloaded", timeout=90000)
+
+    async def _refresh_project_documents(self) -> set[str]:
+        """Re-read only visible project tabs from this exact browser context."""
+        candidates: set[str] = set()
+        self.provider_project_ids.clear()
+        self.accessible_document_ids.clear()
+        for page in list(self.context.pages or []):
+            project_id = _project_id_from_url(getattr(page, "url", ""))
+            if not project_id:
+                continue
+            candidates.add(project_id)
+        self.validation_candidate_ids = set(candidates)
+        for page in list(self.context.pages or []):
+            project_id = _project_id_from_url(getattr(page, "url", ""))
+            if not project_id:
+                continue
+            try:
+                response = await page.reload(wait_until="domcontentloaded", timeout=90000)
+                if response is not None:
+                    await self._record_provider_project_response(response)
+            except Exception:
+                continue
+        return candidates
+
+    async def _refresh_current_user_project_membership(self, candidates: set[str]) -> None:
+        """Trigger only the modern read-only current-user project listing.
+
+        The provider response listener records UUIDs only from a successful
+        SearchUserProjects/GetProjects RPC. Opening the homepage in a
+        disposable tab avoids treating the generic project SPA document as
+        ownership evidence and preserves the owner's exact project tab.
+        """
+        if self.context is None or not candidates:
+            return
+        page = None
+        try:
+            page = await self.context.new_page()
+            await page.goto(
+                MODERN_FLOW_HOME_URL,
+                wait_until="domcontentloaded",
+                timeout=90000,
+            )
+            for _ in range(40):
+                if candidates & self.provider_project_ids:
+                    return
+                await asyncio.sleep(0.25)
+        except Exception:
+            return
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
     def _scope(self, generation: str, profile_id: int) -> None:
         if generation != self.generation or profile_id != self.profile_id:
@@ -388,6 +671,8 @@ class LoginWorker:
             self.profile_id = profile_id
             self.proxy_url = proxy_url
             self.provider_project_ids.clear()
+            self.accessible_document_ids.clear()
+            self.validation_candidate_ids.clear()
             self.state = "starting_browser"
             try:
                 await self._open_browser()
@@ -397,25 +682,96 @@ class LoginWorker:
             self.state = "ready"
             return self.public()
 
-    async def validate(self, generation: str, profile_id: int) -> dict:
+    async def recover(self, generation: str, profile_id: int, proxy_url: str) -> dict:
+        """Reopen only this worker's retained, unowned Profile after expiry.
+
+        The signed control plane must bind the original claimed Profile to
+        this exact slot; this worker has no Updater database or other mount.
+        No old generation or invitation is reused.
+        """
+        async with self.lock:
+            profile_dir = self._safe_profile_dir()
+            if (
+                self.state != "quarantined" or self.context is not None
+                or self.generation or self.profile_id or not any(profile_dir.iterdir())
+                or profile_dir.stat().st_uid != os.geteuid()
+            ):
+                raise HTTPException(409, "worker is not an unowned retained Profile")
+            if await self._profile_browser_processes():
+                raise HTTPException(409, "a browser still owns the retained Profile")
+            self._remove_stale_browser_locks()
+            if proxy_url != "http://127.0.0.1:18088" and not (
+                proxy_url == "direct://" and ALLOW_DIRECT_TEST_EGRESS
+            ):
+                raise HTTPException(400, "worker accepts only its assigned source-proxy route")
+            self.generation = generation
+            self.profile_id = profile_id
+            self.proxy_url = proxy_url
+            self.provider_project_ids.clear()
+            self.accessible_document_ids.clear()
+            self.validation_candidate_ids.clear()
+            self.state = "starting_browser"
+            try:
+                await self._open_browser()
+            except Exception:
+                self.state = "quarantined"
+                raise
+            self.state = "ready"
+            return self.public()
+
+    async def validate(
+        self,
+        generation: str,
+        profile_id: int,
+        expected_existing_project_id: str = "",
+    ) -> dict:
         async with self.lock:
             self._scope(generation, profile_id)
             if self.state != "ready" or self.context is None:
                 raise HTTPException(409, "browser is not ready for validation")
             self.state = "checking"
+            self.project_probe_counts.clear()
+            self.project_probe_rpc_ids.clear()
             await self._stop_vnc()
             result: dict[str, Any]
             try:
+                expected_project_id = ""
+                if expected_existing_project_id:
+                    try:
+                        expected_project_id = str(UUID(expected_existing_project_id.strip()))
+                    except (ValueError, TypeError, AttributeError):
+                        result = {
+                            "success": False,
+                            "error_code": "existing_project_invalid",
+                            "error": "既有项目校验目标格式无效",
+                        }
+                        self.state = "ready"
+                        await self._start_vnc()
+                        return {
+                            **self.public(), **result,
+                            "is_logged_in": False, "has_flow_project": False,
+                        }
                 initial = await self._validate_context_session("")
                 checked = validate_google_cookies(
                     scoped_google_cookies(await self.context.cookies())
                 ) if initial.get("success") else initial
                 identity = self._normalize_email(initial.get("email") or "")
-                candidates = {
-                    item for page in list(self.context.pages or [])
-                    if (item := _project_id_from_url(getattr(page, "url", "")))
-                }
-                await asyncio.sleep(0.25)
+                if checked.get("success") and expected_project_id:
+                    existing_page = await self.context.new_page()
+                    try:
+                        await existing_page.goto(
+                            f"https://flow.google.com/project/{expected_project_id}",
+                            wait_until="domcontentloaded",
+                            timeout=90000,
+                        )
+                    except Exception:
+                        pass
+                candidates = await self._refresh_project_documents() if checked.get("success") else set()
+                if expected_project_id:
+                    candidates &= {expected_project_id}
+                    self.validation_candidate_ids = set(candidates)
+                if checked.get("success"):
+                    await self._refresh_current_user_project_membership(candidates)
                 final = await self._validate_context_session(identity)
                 final_checked = validate_google_cookies(
                     scoped_google_cookies(await self.context.cookies())
@@ -429,9 +785,120 @@ class LoginWorker:
                               "error": "验证期间身份或 Cookie 发生变化"}
                 elif len(project_ids) != 1:
                     result = {"success": False, "error_code": "project_ownership_unverified",
-                              "error": "未从同一身份的只读 provider 响应确认唯一 Flow 项目"}
+                              "error": "项目页面可访问，但缺少绑定当前身份的只读 provider 项目归属响应",
+                              "probe_counts": dict(self.project_probe_counts),
+                              "probe_rpc_ids": sorted(self.project_probe_rpc_ids)[:12],
+                              "candidate_count": len(candidates),
+                              "candidate_visible": bool(
+                                  len(candidates) == 1
+                                  and await self._project_page_is_accessible(next(iter(candidates)))
+                              )}
                 else:
                     project_id = next(iter(project_ids))
+                    if not await self._project_page_is_accessible(project_id):
+                        result = {
+                            "success": False,
+                            "error_code": "project_ownership_unverified",
+                            "error": "同一浏览器中的 Flow 项目页面未通过可见访问检查",
+                        }
+                    else:
+                        await self.context.close()
+                        self.context = None
+                        if await self._profile_browser_processes():
+                            raise RuntimeError("browser still owns the Profile after close")
+                        self.state = "validated"
+                        return {
+                            **self.public(),
+                            "success": True,
+                            "is_logged_in": True,
+                            "has_flow_project": True,
+                            "identity": final_identity,
+                            "project_id": project_id,
+                        }
+            except Exception:
+                result = {"success": False, "error_code": "verification_unavailable",
+                          "error": "worker 无法完成无成本检查；Profile 已保留"}
+            self.state = "ready"
+            await self._start_vnc()
+            return {**self.public(), **result, "is_logged_in": False, "has_flow_project": False}
+
+    async def validate_account_projects(
+        self,
+        generation: str,
+        profile_id: int,
+        expected_existing_project_id: str = "",
+    ) -> dict:
+        """Validate current identity and read-only account project membership.
+
+        This is the existing-token recovery branch.  It never accepts a UUID
+        supplied by an operator as proof, never creates or mutates a project,
+        and returns no identity, UUID, payload or URL.  The expected UUID is
+        used only for a boolean local comparison against the provider's
+        authenticated SearchUserProjects/GetProjects response.
+        """
+        async with self.lock:
+            self._scope(generation, profile_id)
+            if self.state != "ready" or self.context is None:
+                raise HTTPException(409, "browser is not ready for validation")
+            self.state = "checking"
+            self.project_probe_counts.clear()
+            self.project_probe_rpc_ids.clear()
+            await self._stop_vnc()
+            result: dict[str, Any]
+            try:
+                expected = ""
+                if expected_existing_project_id:
+                    try:
+                        expected = str(UUID(expected_existing_project_id.strip()))
+                    except (ValueError, TypeError, AttributeError):
+                        result = failure("existing_project_invalid", "既有项目校验目标格式无效")
+                    else:
+                        result = {}
+                else:
+                    result = {}
+                initial = await self._validate_context_session("") if not result else result
+                checked = validate_google_cookies(
+                    scoped_google_cookies(await self.context.cookies())
+                ) if initial.get("success") else initial
+                identity = self._normalize_email(initial.get("email") or "")
+                self.provider_project_ids.clear()
+                self.validation_candidate_ids.clear()
+                if checked.get("success"):
+                    page = None
+                    try:
+                        page = await self.context.new_page()
+                        await page.goto(
+                            MODERN_FLOW_HOME_URL,
+                            wait_until="domcontentloaded",
+                            timeout=90000,
+                        )
+                        for _ in range(40):
+                            if self.provider_project_ids:
+                                break
+                            await asyncio.sleep(0.25)
+                    except Exception:
+                        pass
+                    finally:
+                        if page is not None:
+                            try:
+                                await page.close()
+                            except Exception:
+                                pass
+                final = await self._validate_context_session(identity)
+                final_checked = validate_google_cookies(
+                    scoped_google_cookies(await self.context.cookies())
+                ) if final.get("success") else final
+                final_identity = self._normalize_email(final.get("email") or "")
+                if not initial.get("success") or not checked.get("success"):
+                    result = initial if not initial.get("success") else checked
+                elif not final.get("success") or not final_checked.get("success") or final_identity != identity:
+                    result = failure("context_changed", "验证期间身份或 Cookie 发生变化")
+                elif not self.provider_project_ids:
+                    result = failure(
+                        "project_membership_unverified",
+                        "未获得当前身份的只读项目列表响应",
+                    )
+                else:
                     await self.context.close()
                     self.context = None
                     if await self._profile_browser_processes():
@@ -441,16 +908,20 @@ class LoginWorker:
                         **self.public(),
                         "success": True,
                         "is_logged_in": True,
-                        "has_flow_project": True,
+                        "has_account_projects": True,
+                        "existing_project_present": bool(expected and expected in self.provider_project_ids),
                         "identity": final_identity,
-                        "project_id": project_id,
                     }
             except Exception:
-                result = {"success": False, "error_code": "verification_unavailable",
-                          "error": "worker 无法完成无成本检查；Profile 已保留"}
+                result = failure("verification_unavailable", "worker 无法完成无成本检查；Profile 已保留")
             self.state = "ready"
             await self._start_vnc()
-            return {**self.public(), **result, "is_logged_in": False, "has_flow_project": False}
+            return {
+                **self.public(), **result,
+                "is_logged_in": False,
+                "has_account_projects": False,
+                "existing_project_present": False,
+            }
 
     async def _profile_browser_processes(self) -> list[int]:
         needle = str(self._safe_profile_dir()).encode()
@@ -464,6 +935,29 @@ class LoginWorker:
             except (FileNotFoundError, PermissionError, ProcessLookupError):
                 continue
         return found
+
+    def _remove_stale_browser_locks(self) -> None:
+        """Remove only Chromium singleton artifacts after owner-process proof.
+
+        A retained Profile records the prior worker container hostname in
+        these top-level entries. Container recreation makes those artifacts
+        stale even though no process owns the mounted Profile. Never recurse
+        or accept a directory at one of the three exact lock names.
+        """
+        root = self._safe_profile_dir()
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            path = root / name
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if not (
+                stat.S_ISLNK(mode)
+                or stat.S_ISREG(mode)
+                or stat.S_ISSOCK(mode)
+            ):
+                raise RuntimeError("unexpected Chromium singleton artifact")
+            path.unlink()
 
     async def cleanup(self, generation: str, profile_id: int) -> dict:
         async with self.lock:
@@ -486,23 +980,39 @@ class LoginWorker:
             self.profile_id = 0
             self.proxy_url = ""
             self.provider_project_ids.clear()
+            self.accessible_document_ids.clear()
+            self.validation_candidate_ids.clear()
             self.state = "idle"
             return result
 
     async def abort(self, generation: str, profile_id: int) -> dict:
         async with self.lock:
-            self._scope(generation, profile_id)
+            # After a worker-container restart, retained Profile data is
+            # quarantined while the in-memory assignment is intentionally
+            # empty.  Accept the control plane's persisted, signed old
+            # generation only for this already-stopped state.  A live or
+            # differently assigned context still requires an exact match.
+            unowned_retained = bool(
+                self.state == "quarantined"
+                and self.context is None
+                and not self.generation
+                and not self.profile_id
+                and any(self._safe_profile_dir().iterdir())
+            )
+            if not unowned_retained:
+                self._scope(generation, profile_id)
             await self._stop_vnc()
             if self.context:
                 await self.context.close()
                 self.context = None
             self.state = "quarantined" if any(self._safe_profile_dir().iterdir()) else "idle"
+            self.generation = ""
+            self.profile_id = 0
+            self.proxy_url = ""
+            self.provider_project_ids.clear()
+            self.accessible_document_ids.clear()
+            self.validation_candidate_ids.clear()
             result = self.public()
-            if self.state == "idle":
-                self.generation = ""
-                self.profile_id = 0
-                self.proxy_url = ""
-                self.provider_project_ids.clear()
             return result
 
     def public(self) -> dict:
@@ -626,10 +1136,31 @@ async def assign(request: Request) -> dict:
     return await worker.assign(generation, profile_id, proxy_url)
 
 
+@app.post("/recover")
+async def recover(request: Request) -> dict:
+    generation, profile_id, payload = await _authorized(request, "/recover")
+    proxy_url = str(payload.get("proxy_url") or "")
+    return await worker.recover(generation, profile_id, proxy_url)
+
+
 @app.post("/validate")
 async def validate(request: Request) -> dict:
-    generation, profile_id, _ = await _authorized(request, "/validate")
-    return await worker.validate(generation, profile_id)
+    generation, profile_id, payload = await _authorized(request, "/validate")
+    return await worker.validate(
+        generation,
+        profile_id,
+        str(payload.get("expected_existing_project_id") or ""),
+    )
+
+
+@app.post("/validate-account-projects")
+async def validate_account_projects(request: Request) -> dict:
+    generation, profile_id, payload = await _authorized(request, "/validate-account-projects")
+    return await worker.validate_account_projects(
+        generation,
+        profile_id,
+        str(payload.get("expected_existing_project_id") or ""),
+    )
 
 
 @app.post("/cleanup")

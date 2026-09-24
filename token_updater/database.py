@@ -42,6 +42,8 @@ class ProfileDB:
                     connection_token_override TEXT,
                     login_slot_prepared INTEGER DEFAULT 0,
                     login_slot_claimed INTEGER DEFAULT 0,
+                    login_slot_number INTEGER DEFAULT 0,
+                    login_slot_generation TEXT,
                     login_slot_handoff_complete INTEGER DEFAULT 0,
                     observed_flow_project_id TEXT,
                     observed_flow_project_verified INTEGER DEFAULT 0,
@@ -79,6 +81,10 @@ class ProfileDB:
                 await db.execute("ALTER TABLE profiles ADD COLUMN login_slot_prepared INTEGER DEFAULT 0")
             if 'login_slot_claimed' not in columns:
                 await db.execute("ALTER TABLE profiles ADD COLUMN login_slot_claimed INTEGER DEFAULT 0")
+            if 'login_slot_number' not in columns:
+                await db.execute("ALTER TABLE profiles ADD COLUMN login_slot_number INTEGER DEFAULT 0")
+            if 'login_slot_generation' not in columns:
+                await db.execute("ALTER TABLE profiles ADD COLUMN login_slot_generation TEXT")
             if 'login_slot_handoff_complete' not in columns:
                 await db.execute("ALTER TABLE profiles ADD COLUMN login_slot_handoff_complete INTEGER DEFAULT 0")
             if 'observed_flow_project_id' not in columns:
@@ -182,15 +188,26 @@ class ProfileDB:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def claim_login_slot(self, profile_id: int) -> bool:
-        """Persist single-use invitation ownership before returning any link."""
+    async def claim_login_slot(
+        self, profile_id: int, slot_number: int, generation: str
+    ) -> bool:
+        """Persist slot ownership and its non-secret worker generation.
+
+        The owner capability remains memory-only.  The generation is durable
+        solely so a restarted control process can sign one scoped ``abort``
+        for the old browser context before issuing a new invitation.
+        """
+        if slot_number not in {1, 2} or not generation or len(generation) > 128:
+            return False
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """UPDATE profiles
-                   SET login_slot_claimed = 1, login_slot_prepared = 0
+                   SET login_slot_claimed = 1, login_slot_prepared = 0,
+                       login_slot_number = ?, login_slot_generation = ?
                    WHERE id = ?
                    AND COALESCE(login_slot_prepared, 0) = 1
                    AND COALESCE(login_slot_claimed, 0) = 0
+                   AND COALESCE(login_slot_generation, '') = ''
                    AND COALESCE(login_slot_handoff_complete, 0) = 0
                    AND COALESCE(is_active, 0) = 0
                    AND COALESCE(is_logged_in, 0) = 0
@@ -215,7 +232,7 @@ class ProfileDB:
                    AND COALESCE(proxy_enabled, 0) = 1
                    AND COALESCE(proxy_url, '') != ''
                    AND COALESCE(captcha_proxy_url, '') != ''""",
-                (profile_id,),
+                (slot_number, generation, profile_id),
             )
             await db.commit()
             return cursor.rowcount == 1
@@ -231,6 +248,36 @@ class ProfileDB:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(f"UPDATE profiles SET {fields} WHERE id = ?", values)
             await db.commit()
+
+    async def rotate_login_slot_generation(
+        self,
+        profile_id: int,
+        slot_number: int,
+        previous_generation: str,
+        next_generation: str,
+    ) -> bool:
+        """Atomically rotate only an unfinished slot's worker generation."""
+        if (
+            slot_number not in {1, 2}
+            or not previous_generation
+            or not next_generation
+            or len(previous_generation) > 128
+            or len(next_generation) > 128
+        ):
+            return False
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """UPDATE profiles
+                   SET login_slot_generation = ?
+                   WHERE id = ?
+                     AND login_slot_claimed = 1
+                     AND COALESCE(login_slot_handoff_complete, 0) = 0
+                     AND login_slot_number = ?
+                     AND login_slot_generation = ?""",
+                (next_generation, profile_id, slot_number, previous_generation),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
     
     async def delete_profile(self, profile_id: int):
         """删除 profile"""

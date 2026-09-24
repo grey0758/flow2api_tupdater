@@ -1,0 +1,8 @@
+ARG BASE_IMAGE=flow2api-token-updater-slot3-sidecar:slot3-20260921r5
+FROM ${BASE_IMAGE}
+
+USER root
+COPY token_updater/login_slot_sidecar.py /app/token_updater/login_slot_sidecar.py
+RUN chmod 0644 /app/token_updater/login_slot_sidecar.py
+USER 12003:12000
+CMD ["python", "-m", "token_updater.login_slot_sidecar"]

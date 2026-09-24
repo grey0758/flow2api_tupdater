@@ -24,6 +24,7 @@ class FlowSessionSyncTests(unittest.IsolatedAsyncioTestCase):
              patch("token_updater.updater.dashboard_events.publish", AsyncMock()), \
              patch("token_updater.protocol_login.protocol_loginer.login", AsyncMock()) as protocol, \
              patch.object(syncer, "_extract_token_with_timeout", AsyncMock(return_value="session")), \
+             patch.object(syncer, "_verify_destination_session", AsyncMock(return_value={"success": True})), \
              patch.object(syncer, "_push_to_flow2api", AsyncMock(return_value={"success":True, "action":"updated"})) as push:
             result = await syncer._sync_profile(1)
         self.assertTrue(result["success"])
@@ -32,14 +33,33 @@ class FlowSessionSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("captcha_proxy_url", push.await_args.kwargs)
 
     async def test_transport_sends_full_jar_and_explicit_target_proxy(self):
-        response = SimpleNamespace(status_code=200, json=lambda: {"success":True,"cookies_updated":True,"flow_cookies_configured":True,"google_session_cookies_configured":True,"proxy_updated":True,"proxy_configured":True,"oauth_verified":True,"account_active":True})
+        project_id = "0f6ddfcf-11ce-4a79-9792-b23cc4d189aa"
+        response = SimpleNamespace(status_code=200, json=lambda: {
+            "success": True, "cookies_updated": True,
+            "flow_cookies_configured": True,
+            "google_session_cookies_configured": True,
+            "proxy_updated": True, "proxy_configured": True,
+            "oauth_verified": True, "account_active": True,
+            "pending_enable": False, "action": "updated", "token_id": 11,
+            "email": "owner@example.test", "current_project_id": project_id,
+            "project_context_accepted": True, "project_owned": True,
+            "at_expires": "2099-01-01T00:00:00+00:00", "needs_refresh": False,
+        })
         client = AsyncMock()
         client.__aenter__.return_value = client
         client.post.return_value = response
         with patch("token_updater.updater.httpx.AsyncClient", return_value=client):
-            result = await TokenSyncer()._push_to_flow2api("session", "http://server", "key", google_cookies=JAR, captcha_proxy_url="socks5://host.docker.internal:20001")
+            result = await TokenSyncer()._push_to_flow2api(
+                "session", "http://server", "key", google_cookies=JAR,
+                captcha_proxy_url="socks5://host.docker.internal:20001",
+                project_id=project_id,
+            )
         self.assertTrue(result["success"])
-        self.assertEqual(client.post.await_args.kwargs["json"], {"session_token":"session", "google_cookies":JAR, "captcha_proxy_url":"socks5://host.docker.internal:20001"})
+        self.assertEqual(client.post.await_args.kwargs["json"], {
+            "session_token":"session", "google_cookies":JAR,
+            "captcha_proxy_url":"socks5://host.docker.internal:20001",
+            "project_id": project_id,
+        })
 
     async def test_rejects_old_server_that_silently_ignores_cookie_payload(self):
         client = AsyncMock()

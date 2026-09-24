@@ -1514,7 +1514,12 @@ async function checkLogin(profileId, button) {
     await withOperationLock(button, "检测中...", {action: "check_login", label: "检测登录状态", profile_id: profileId}, async () => {
         const result = await json(`${API}/api/profiles/${profileId}/check-login`, {method: "POST"});
         await refreshDashboard(false, true);
-        toast(result.is_logged_in ? "已登录" : "未登录或已过期", result.is_logged_in ? "success" : "error");
+        toast(
+            result.is_logged_in
+                ? "无成本检查通过；仍需身份去重、一次同步和独立图片验收"
+                : "无成本检查未通过或授权已过期",
+            result.is_logged_in ? "success" : "error",
+        );
     });
 }
 

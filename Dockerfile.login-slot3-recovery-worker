@@ -1,0 +1,13 @@
+ARG BASE_IMAGE=flow2api-token-updater-login-worker:profile-recovery-diag2
+FROM ${BASE_IMAGE}
+
+USER root
+COPY token_updater/login_worker.py /app/token_updater/login_worker.py
+RUN (getent passwd 11003 >/dev/null || useradd --uid 11003 --gid 12000 --no-create-home --shell /usr/sbin/nologin login-slot3) \
+    && mkdir -p /slot/profile /control /egress \
+    && chmod 0644 /app/token_updater/login_worker.py \
+    && chown 11003:12000 /slot/profile /control /egress \
+    && chmod 0700 /slot/profile \
+    && chmod 0770 /control /egress
+USER 11003:12000
+CMD ["python", "-m", "token_updater.login_worker"]

@@ -15,6 +15,7 @@ ACK = {"success": True, "cookies_updated": True, "flow_cookies_configured": True
        "oauth_verified": True, "account_active": True, "action": "updated"}
 PROFILE = {"id": 1, "name": "test", "email": "user@example.com", "google_cookies": json.dumps(JAR),
            "flow2api_url": "http://server", "connection_token_override": "key"}
+PROJECT_ID = "0f6ddfcf-11ce-4a79-9792-b23cc4d189aa"
 
 
 def test_overdue_check_accepts_timezone_aware_imported_timestamps():
@@ -67,6 +68,81 @@ async def test_saved_or_unverified_is_not_recovered(changes, code):
 async def test_gemini_ack_stays_compatible():
     with patch("token_updater.updater.httpx.AsyncClient", return_value=client_for(200, {"success": True})):
         assert (await TokenSyncer()._push_to_flow2api("gcu:v1:payload", "http://server", "key"))["success"]
+
+
+@pytest.mark.asyncio
+async def test_modern_flow_ack_requires_future_expiry_and_stable_project_contract():
+    complete = {
+        **ACK,
+        "token_id": 7,
+        "email": "user@example.com",
+        "current_project_id": PROJECT_ID,
+        "project_context_accepted": True,
+        "project_owned": True,
+        "pending_enable": False,
+        "at_expires": (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(),
+        "needs_refresh": False,
+    }
+    with patch(
+        "token_updater.updater.httpx.AsyncClient",
+        return_value=client_for(200, complete),
+    ):
+        accepted = await TokenSyncer()._push_to_flow2api(
+            "st", "http://server", "key", google_cookies=JAR,
+            project_id=PROJECT_ID,
+        )
+    assert accepted["success"]
+    assert accepted["token_id"] == 7
+    assert accepted["project_owned"] is True
+
+    with patch(
+        "token_updater.updater.httpx.AsyncClient",
+        return_value=client_for(200, {**complete, "at_expires": None}),
+    ):
+        rejected = await TokenSyncer()._push_to_flow2api(
+            "st", "http://server", "key", google_cookies=JAR,
+            project_id=PROJECT_ID,
+        )
+    assert not rejected["success"]
+    assert rejected["error_code"] == "destination_contract_incomplete"
+    assert rejected["synced"] is True
+
+
+@pytest.mark.asyncio
+async def test_post_write_readback_requires_one_exact_usable_token():
+    syncer = TokenSyncer()
+    pushed = {"token_id": 7, "account_active": True}
+    valid = {
+        "id": 7,
+        "email": "user@example.com",
+        "is_active": True,
+        "needs_refresh": False,
+        "at_expires": (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(),
+        "current_project_id": PROJECT_ID,
+        "project_owned": True,
+    }
+    with patch.object(
+        syncer,
+        "_check_tokens_status",
+        AsyncMock(return_value={"success": True, "tokens": [valid]}),
+    ):
+        accepted = await syncer._verify_destination_session(
+            "http://server", "key", expected_email="user@example.com",
+            expected_project_id=PROJECT_ID, pushed=pushed,
+        )
+    assert accepted["success"]
+
+    with patch.object(
+        syncer,
+        "_check_tokens_status",
+        AsyncMock(return_value={"success": True, "tokens": [{**valid, "needs_refresh": True}]}),
+    ):
+        rejected = await syncer._verify_destination_session(
+            "http://server", "key", expected_email="user@example.com",
+            expected_project_id=PROJECT_ID, pushed=pushed,
+        )
+    assert rejected["error_code"] == "destination_session_unusable"
+    assert rejected["synced"] is True
 
 
 @pytest.mark.asyncio
