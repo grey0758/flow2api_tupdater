@@ -227,7 +227,7 @@ def dedupe_state(state: dict[str, Any]) -> dict[str, int]:
 def newapi_boundary() -> dict[str, int]:
     query = (
         'SELECT COALESCE(MAX(id),0) FROM logs; '
-        'SELECT COUNT(*) FROM tasks; '
+        "SELECT COUNT(*) FROM tasks WHERE status IS NULL OR status NOT IN ('SUCCESS','FAILURE'); "
         'SELECT COUNT(*) FROM tokens WHERE id=67 AND status=1 AND deleted_at IS NULL; '
         'SELECT COUNT(*) FROM channels WHERE id=8 AND status=1;'
     )
@@ -246,12 +246,12 @@ def newapi_boundary() -> dict[str, int]:
         raise OperatorError("newapi_boundary_failed", "无法读取 NewAPI 只读边界")
     try:
         values = [int(line.strip()) for line in result.stdout.splitlines() if line.strip()]
-        max_log, tasks, token_enabled, channel_enabled = values
+        max_log, nonterminal_tasks, token_enabled, channel_enabled = values
     except (TypeError, ValueError):
         raise OperatorError("newapi_boundary_invalid", "NewAPI 只读边界格式无效")
     return {
         "max_log": max_log,
-        "tasks": tasks,
+        "nonterminal_tasks": nonterminal_tasks,
         "operations_token_enabled": token_enabled,
         "channel_enabled": channel_enabled,
     }

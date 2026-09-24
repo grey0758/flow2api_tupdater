@@ -83,7 +83,7 @@ def test_run_orders_backup_before_single_onboard_and_stops_pending(tmp_path):
 
     def backup(*_):
         events.append("backup")
-        return tmp_path, {"max_log": 1, "tasks": 0}
+        return tmp_path, {"max_log": 1, "nonterminal_tasks": 0}
 
     def api(mode, _):
         events.append(mode)
@@ -114,3 +114,25 @@ def test_run_orders_backup_before_single_onboard_and_stops_pending(tmp_path):
     assert events == ["backup", "onboard", "verify"]
     assert result["pending_image_acceptance"] is True
     assert (tmp_path / "PENDING_IMAGE_ACCEPTANCE").is_file()
+
+
+def test_newapi_boundary_counts_only_nonterminal_tasks():
+    completed = type(
+        "Completed",
+        (),
+        {
+            "returncode": 0,
+            "stdout": "34562\n0\n1\n1\n",
+        },
+    )()
+    with patch.object(module.subprocess, "run", return_value=completed) as run:
+        boundary = module.newapi_boundary()
+
+    assert boundary == {
+        "max_log": 34562,
+        "nonterminal_tasks": 0,
+        "operations_token_enabled": 1,
+        "channel_enabled": 1,
+    }
+    command = run.call_args.args[0][-1]
+    assert "status IS NULL OR status NOT IN ('SUCCESS','FAILURE')" in command
