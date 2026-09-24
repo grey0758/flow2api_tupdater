@@ -1,6 +1,7 @@
 """Token Updater entrypoint v3.3 (lightweight)."""
 
 import uvicorn
+from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -10,6 +11,7 @@ from .config import config
 from .database import profile_db
 from .execution import execution_gate
 from .logger import logger
+from .scheduling import status_poll_interval_minutes
 from .updater import token_syncer
 
 
@@ -54,20 +56,27 @@ async def startup():
         await login_slots.reconcile()
         logger.info("独立登录槽位启动对账完成")
 
+    poll_interval = status_poll_interval_minutes(config.refresh_interval)
     scheduler.add_job(
         scheduled_sync,
-        trigger=IntervalTrigger(minutes=config.refresh_interval),
+        trigger=IntervalTrigger(minutes=poll_interval),
         id=SYNC_JOB_ID,
         max_instances=1,
         coalesce=True,
         replace_existing=True,
+        next_run_time=datetime.now(timezone.utc),
     )
     scheduler.start()
 
     app.state.scheduler = scheduler
     app.state.sync_job_id = SYNC_JOB_ID
+    app.state.sync_poll_interval_minutes = poll_interval
 
-    logger.info(f"定时任务已启动: 每 {config.refresh_interval} 分钟执行一次")
+    logger.info(
+        "定时任务已启动: 每 %s 分钟检查一次，健康 Profile 至少间隔 %s 分钟刷新",
+        poll_interval,
+        config.refresh_interval,
+    )
     logger.info(f"Flow2API URL: {config.flow2api_url}")
     logger.info(f"API 端口: {config.api_port}")
     logger.info("")

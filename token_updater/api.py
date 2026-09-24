@@ -4,7 +4,7 @@ import time
 import asyncio
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
@@ -23,6 +23,7 @@ from .database import profile_db
 from .events import dashboard_events
 from .execution import execution_gate
 from .logger import logger
+from .scheduling import status_poll_interval_minutes
 from .login_slots import LoginSlotError, login_slots
 from .proxy_utils import validate_proxy_format
 from .updater import token_syncer
@@ -1026,13 +1027,29 @@ async def login_slot_asset(request: Request, asset: str):
 
 
 @app.get("/api/status")
-async def get_status(token: str = Depends(verify_session)):
+async def get_status(api_request: Request, token: str = Depends(verify_session)):
     profiles = await profile_db.get_all_profiles()
+    scheduler = getattr(api_request.app.state, "scheduler", None)
+    job_id = getattr(api_request.app.state, "sync_job_id", "token_sync")
+    job = scheduler.get_job(job_id) if scheduler else None
     return {
         "browser": browser_manager.get_status(),
         "login_slots": login_slots.status(),
         "execution": execution_gate.get_status(),
         "syncer": token_syncer.get_status(),
+        "scheduler": {
+            "running": bool(scheduler and scheduler.running),
+            "poll_interval_minutes": getattr(
+                api_request.app.state,
+                "sync_poll_interval_minutes",
+                status_poll_interval_minutes(config.refresh_interval),
+            ),
+            "next_run_time": (
+                job.next_run_time.isoformat()
+                if job is not None and job.next_run_time is not None
+                else None
+            ),
+        },
         "profiles": {
             "total": len(profiles),
             "logged_in": sum(1 for profile in profiles if profile.get("is_logged_in")),
@@ -1509,10 +1526,13 @@ async def update_config(request: UpdateConfigRequest, api_request: Request, toke
         job_id = getattr(api_request.app.state, "sync_job_id", "token_sync")
         if scheduler:
             try:
+                poll_interval = status_poll_interval_minutes(config.refresh_interval)
                 scheduler.reschedule_job(
                     job_id,
-                    trigger=IntervalTrigger(minutes=config.refresh_interval),
+                    trigger=IntervalTrigger(minutes=poll_interval),
+                    next_run_time=datetime.now(timezone.utc),
                 )
+                api_request.app.state.sync_poll_interval_minutes = poll_interval
             except Exception as exc:
                 logger.warning(f"更新定时任务失败: {exc}")
 

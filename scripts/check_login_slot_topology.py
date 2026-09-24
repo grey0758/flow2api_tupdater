@@ -32,7 +32,8 @@ for number, worker in enumerate(workers, 1):
         fail(f"worker {number} resource limits are incomplete")
     env = worker.get("environment", {})
     allowed_env = {
-        "DISPLAY", "HOME", "LABS_URL", "LOGIN_EGRESS_SOCKET", "LOGIN_PROFILE_DIR",
+        "DISPLAY", "FLOW_URL", "HOME", "LABS_AUTH_URL", "LABS_URL",
+        "LOGIN_EGRESS_SOCKET", "LOGIN_PROFILE_DIR",
         "LOGIN_SLOT_NUMBER", "LOGIN_SLOT_SIGNING_PUBLIC_KEY", "LOGIN_WORKER_RUNTIME_DIR",
         "LOGIN_WORKER_SOCKET", "LOG_DIR", "PLAYWRIGHT_BROWSERS_PATH", "RESOLUTION",
     }
