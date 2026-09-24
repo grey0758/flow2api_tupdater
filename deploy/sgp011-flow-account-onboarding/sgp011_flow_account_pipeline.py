@@ -287,7 +287,8 @@ def send_invitation(
         f"邀请链接：{invite_url}\n"
         "VNC Basic Auth 用户名：flowlogin\n"
         f"VNC Basic Auth 密码：{password}\n"
-        "请在独立桌面完成 Google/Flow 与 Labs 可见授权；遇到 CAPTCHA、设备确认或恢复挑战请人工处理。"
+        "请在独立桌面完成 Google/Flow 与 Labs 可见授权；遇到 CAPTCHA、设备确认或恢复挑战请人工处理。\n"
+        "请勿安装打码扩展；系统会保留该 Profile/VNC，人工完成后继续无成本检查。"
     )
     result = run([str(WECOM_SENDER)], input_text=body, timeout=300)
     reply = parse_last_json(result.stdout)

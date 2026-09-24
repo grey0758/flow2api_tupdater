@@ -37,6 +37,10 @@ sgp011 的 OpenBao 批量导入、邀请、去重、单次同步、独立图片�
 由 [生产账号导入流水线](deploy/sgp011-flow-account-onboarding/README.md) 分阶段执行。
 该流水线刻意不读取或自动填写 Google 密码、TOTP/MFA，也不处理 CAPTCHA、设备
 确认、恢复挑战或 consent；这些步骤始终由账号 owner 在独立 VNC 中可见完成。
+登录 worker 强制禁用扩展，不会安装 YesCaptcha 或其他打码扩展，也不会从
+OpenBao 读取打码密钥注入浏览器。登录检查识别到 Google 挑战时，只返回
+`manual_action_required`并保留原 Profile/VNC；人工完成后可对同一上下文再做无成本检查。
+生图运行时的服务端 YesCaptcha 是独立边界，不得复用于 Google 账号登录。
 - 仪表盘定时轮询：避免将管理员会话放入 SSE URL 和访问日志
 - 图表范围切换：6 小时 / 24 小时 / 72 小时 / 7 天
 - 内置分析：同步活动、失败原因、目标实例分布

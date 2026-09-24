@@ -166,7 +166,10 @@ try:
     session = login["token"]
     if mode == "check":
         status, result = call(f"/api/profiles/{profile_id}/check-login", "POST", {}, session)
-        keys = ("success", "is_logged_in", "has_flow_project", "error_code")
+        keys = (
+            "success", "is_logged_in", "has_flow_project", "error_code",
+            "requires_manual_action",
+        )
     elif mode == "extract":
         status, result = call(f"/api/profiles/{profile_id}/extract", "POST", {}, session)
         result = {"success": bool(result.get("success")), "token_present": bool(result.get("token_length"))}

@@ -370,6 +370,49 @@ async def test_failed_validation_keeps_same_worker_generation(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_manual_challenge_never_promotes_or_cleans_profile(monkeypatch, tmp_path):
+    from token_updater.browser import browser_manager
+    from token_updater.database import profile_db
+    from token_updater.updater import token_syncer
+
+    _slot_tree(tmp_path, monkeypatch)
+    monkeypatch.setattr(browser_manager, "get_active_profile_id", lambda: None)
+    monkeypatch.setattr(token_syncer, "is_syncing", lambda: False)
+    update = AsyncMock()
+    monkeypatch.setattr(profile_db, "update_profile", update)
+    manager = LoginSlots()
+    manager._reconciled = True
+    calls = []
+
+    async def worker(slot, method, **kwargs):
+        calls.append(method)
+        if method == "assign":
+            return _worker_reply(slot)
+        if method == "validate":
+            return _worker_reply(
+                slot,
+                state="ready",
+                success=False,
+                is_logged_in=False,
+                has_flow_project=False,
+                error_code="manual_action_required",
+                requires_manual_action=True,
+            )
+        raise AssertionError(method)
+
+    monkeypatch.setattr(manager, "_worker", worker)
+    slot = await manager.launch(_profile(182))
+    result = await manager.check_owner_login(slot)
+
+    assert result["error_code"] == "manual_action_required"
+    assert result["requires_manual_action"] is True
+    assert slot.state == "ready"
+    assert manager.has_slot(slot.number)
+    assert calls == ["assign", "validate"]
+    update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_recover_exact_expired_slot_without_reusing_invitation(monkeypatch, tmp_path):
     from token_updater.browser import browser_manager
     from token_updater.updater import token_syncer
@@ -502,6 +545,8 @@ def test_final_topology_declares_two_non_root_profile_workers():
     assert "./data:/app/data" not in worker_one
     assert "/app/data:ro,nosuid,nodev,noexec" in worker_one
     assert '"--enable-automation", "--no-sandbox", "--disable-dev-shm-usage"' in worker
+    assert '"--disable-extensions"' in worker
+    assert "--load-extension" not in worker
     assert "--disable-setuid-sandbox" not in worker
     assert "USER ${WORKER_UID}:12000" in dockerfile
     assert "FROM scratch" in dockerfile
@@ -515,6 +560,173 @@ def test_worker_project_gate_requires_authenticated_provider_response():
     assert "PROJECT_DOCUMENT_PATH" in source
     assert "candidates & self.provider_project_ids" in source
     assert "project_ownership_unverified" in source
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://accounts.google.com/v3/signin/challenge/pwd",
+        "https://accounts.google.com/signin/v2/challenge/ipp",
+        "https://accounts.google.com/Captcha",
+        "https://www.google.com/sorry/index",
+        "https://www.recaptcha.net/recaptcha/api2/anchor",
+    ],
+)
+def test_worker_classifies_google_login_challenge_urls(monkeypatch, url):
+    monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
+    monkeypatch.setenv("LOGIN_SLOT_NUMBER", "3")
+    from token_updater import login_worker as module
+
+    assert module._is_google_login_challenge_url(url) is True
+    assert module._is_google_login_challenge_url(
+        "https://flow.google.com/project/c73bdcfe-ef10-464f-b628-890ee76f28ae"
+    ) is False
+    assert module._is_google_login_challenge_url(
+        "https://attacker.invalid/challenge"
+    ) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        "2-Step Verification\nTo help keep your account safe",
+        "Verify it’s you\nCheck your phone",
+        "验证您本人身份\n两步验证",
+        "确认您不是机器人",
+    ],
+)
+async def test_worker_detects_google_login_challenge_text(monkeypatch, body):
+    monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
+    monkeypatch.setenv("LOGIN_SLOT_NUMBER", "3")
+    from token_updater import login_worker as module
+
+    page = SimpleNamespace(
+        url="https://accounts.google.com/v3/signin/identifier",
+        frames=[],
+        locator=lambda _: SimpleNamespace(
+            inner_text=AsyncMock(return_value=body),
+        ),
+    )
+    worker = module.LoginWorker()
+    worker.context = SimpleNamespace(pages=[page])
+
+    assert await worker._manual_login_challenge_present() is True
+
+
+@pytest.mark.asyncio
+async def test_worker_manual_challenge_keeps_profile_and_vnc_ready(monkeypatch):
+    monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
+    monkeypatch.setenv("LOGIN_SLOT_NUMBER", "1")
+    from token_updater import login_worker as module
+
+    worker = module.LoginWorker()
+    worker.state = "ready"
+    worker.generation = "generation"
+    worker.profile_id = 181
+    worker.context = SimpleNamespace(pages=[])
+    challenge = AsyncMock(return_value=True)
+    stop_vnc = AsyncMock()
+    validate_session = AsyncMock()
+    monkeypatch.setattr(worker, "_manual_login_challenge_present", challenge)
+    monkeypatch.setattr(worker, "_stop_vnc", stop_vnc)
+    monkeypatch.setattr(worker, "_validate_context_session", validate_session)
+
+    result = await worker.validate("generation", 181)
+
+    assert result["success"] is False
+    assert result["error_code"] == "manual_action_required"
+    assert result["requires_manual_action"] is True
+    assert result["state"] == "ready"
+    assert result["browser_running"] is True
+    stop_vnc.assert_not_awaited()
+    validate_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_worker_midcheck_challenge_restores_vnc_without_handoff(monkeypatch):
+    monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
+    monkeypatch.setenv("LOGIN_SLOT_NUMBER", "1")
+    from token_updater import login_worker as module
+
+    worker = module.LoginWorker()
+    worker.state = "ready"
+    worker.generation = "generation"
+    worker.profile_id = 183
+    worker.context = SimpleNamespace(pages=[])
+    challenge_gate = AsyncMock(side_effect=[None, module._ManualLoginChallenge])
+    stop_vnc = AsyncMock()
+    start_vnc = AsyncMock()
+    monkeypatch.setattr(worker, "_require_no_manual_login_challenge", challenge_gate)
+    monkeypatch.setattr(worker, "_validate_context_session", AsyncMock(return_value={
+        "success": False,
+        "error_code": "auth_required",
+    }))
+    monkeypatch.setattr(worker, "_stop_vnc", stop_vnc)
+    monkeypatch.setattr(worker, "_start_vnc", start_vnc)
+
+    result = await worker.validate("generation", 183)
+
+    assert result["error_code"] == "manual_action_required"
+    assert result["requires_manual_action"] is True
+    assert result["state"] == "ready"
+    assert worker.context is not None
+    stop_vnc.assert_awaited_once()
+    start_vnc.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_worker_keeps_disposable_challenge_tab_for_owner(monkeypatch):
+    monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
+    monkeypatch.setenv("LOGIN_SLOT_NUMBER", "1")
+    from token_updater import login_worker as module
+
+    page = SimpleNamespace(goto=AsyncMock(), close=AsyncMock())
+    worker = module.LoginWorker()
+    worker.context = SimpleNamespace(new_page=AsyncMock(return_value=page))
+    monkeypatch.setattr(
+        worker,
+        "_require_no_manual_login_challenge",
+        AsyncMock(side_effect=module._ManualLoginChallenge),
+    )
+
+    with pytest.raises(module._ManualLoginChallenge):
+        await worker._refresh_current_user_project_membership({
+            "c73bdcfe-ef10-464f-b628-890ee76f28ae",
+        })
+
+    page.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_existing_account_challenge_stops_before_project_membership(monkeypatch):
+    monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
+    monkeypatch.setenv("LOGIN_SLOT_NUMBER", "1")
+    from token_updater import login_worker as module
+
+    worker = module.LoginWorker()
+    worker.state = "ready"
+    worker.generation = "generation"
+    worker.profile_id = 184
+    worker.context = SimpleNamespace(pages=[])
+    monkeypatch.setattr(
+        worker,
+        "_manual_login_challenge_present",
+        AsyncMock(return_value=True),
+    )
+    stop_vnc = AsyncMock()
+    validate_session = AsyncMock()
+    monkeypatch.setattr(worker, "_stop_vnc", stop_vnc)
+    monkeypatch.setattr(worker, "_validate_context_session", validate_session)
+
+    result = await worker.validate_account_projects("generation", 184)
+
+    assert result["error_code"] == "manual_action_required"
+    assert result["requires_manual_action"] is True
+    assert result["state"] == "ready"
+    assert result["existing_project_present"] is False
+    stop_vnc.assert_not_awaited()
+    validate_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio

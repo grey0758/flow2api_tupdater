@@ -134,6 +134,69 @@ PROJECT_MEDIA_WORKSPACE_PROMPTS = (
     "what would you like to create?",
     "what do you want to create?",
 )
+GOOGLE_LOGIN_CHALLENGE_HOSTS = frozenset({
+    "accounts.google.com",
+    "google.com",
+    "www.google.com",
+    "recaptcha.net",
+    "www.recaptcha.net",
+})
+GOOGLE_LOGIN_CHALLENGE_PATH_SEGMENTS = frozenset({
+    "challenge",
+    "captcha",
+    "recaptcha",
+    "speedbump",
+    "sorry",
+})
+GOOGLE_LOGIN_CHALLENGE_MARKERS = (
+    "2-step verification",
+    "2 step verification",
+    "verify it’s you",
+    "verify it's you",
+    "check your phone",
+    "confirm you’re not a robot",
+    "confirm you're not a robot",
+    "recaptcha",
+    "enter the characters you see",
+    "get a verification code",
+    "enter the code",
+    "account recovery",
+    "两步验证",
+    "两步驟驗證",
+    "验证您本人身份",
+    "驗證您的身分",
+    "查看您的手机",
+    "請查看手機",
+    "确认您不是机器人",
+    "確認您不是機器人",
+    "输入您看到的字符",
+    "輸入您看到的字元",
+    "获取验证码",
+    "取得驗證碼",
+    "恢复账号",
+    "帳戶復原",
+)
+
+
+class _ManualLoginChallenge(RuntimeError):
+    """Internal control flow for a visible owner-only Google challenge."""
+
+
+def _is_google_login_challenge_url(value: Any) -> bool:
+    """Classify a challenge URL without returning or logging its contents."""
+    try:
+        parsed = urlparse(str(value or ""))
+    except Exception:
+        return False
+    host = str(parsed.hostname or "").lower()
+    if parsed.scheme != "https" or host not in GOOGLE_LOGIN_CHALLENGE_HOSTS:
+        return False
+    segments = {
+        segment.lower()
+        for segment in str(parsed.path or "").split("/")
+        if segment
+    }
+    return bool(segments & GOOGLE_LOGIN_CHALLENGE_PATH_SEGMENTS)
 
 
 def _project_id_from_url(value: Any) -> str | None:
@@ -501,6 +564,49 @@ class LoginWorker:
                 continue
         return False
 
+    async def _manual_login_challenge_present(self) -> bool:
+        """Detect owner-only Google challenges without exposing page data.
+
+        This deliberately does not solve, click, screenshot, export, or log a
+        challenge. The caller keeps the same Profile and visible VNC open so
+        the account owner can complete Google's normal verification flow.
+        """
+        if self.context is None:
+            return False
+        for page in list(self.context.pages or []):
+            try:
+                urls = [getattr(page, "url", "")]
+                urls.extend(
+                    getattr(frame, "url", "")
+                    for frame in list(getattr(page, "frames", []) or [])
+                )
+                if any(_is_google_login_challenge_url(url) for url in urls):
+                    return True
+                parsed = urlparse(str(getattr(page, "url", "") or ""))
+                if str(parsed.hostname or "").lower() not in GOOGLE_LOGIN_CHALLENGE_HOSTS:
+                    continue
+                body = await page.locator("body").inner_text(timeout=3000)
+                normalized = " ".join(str(body or "").lower().split())
+                if any(marker in normalized for marker in GOOGLE_LOGIN_CHALLENGE_MARKERS):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _require_no_manual_login_challenge(self) -> None:
+        if await self._manual_login_challenge_present():
+            raise _ManualLoginChallenge
+
+    @staticmethod
+    def _manual_action_failure() -> dict:
+        return {
+            **failure(
+                "manual_action_required",
+                "Google 要求账号所有者在当前可见登录桌面完成验证",
+            ),
+            "requires_manual_action": True,
+        }
+
     @staticmethod
     def _normalize_email(value: Any) -> str:
         email = str(value or "").strip().lower()
@@ -632,6 +738,7 @@ class LoginWorker:
         if self.context is None or not candidates:
             return
         page = None
+        keep_page_for_owner = False
         try:
             page = await self.context.new_page()
             await page.goto(
@@ -639,14 +746,18 @@ class LoginWorker:
                 wait_until="domcontentloaded",
                 timeout=90000,
             )
+            await self._require_no_manual_login_challenge()
             for _ in range(40):
                 if candidates & self.provider_project_ids:
                     return
                 await asyncio.sleep(0.25)
+        except _ManualLoginChallenge:
+            keep_page_for_owner = True
+            raise
         except Exception:
             return
         finally:
-            if page is not None:
+            if page is not None and not keep_page_for_owner:
                 try:
                     await page.close()
                 except Exception:
@@ -732,6 +843,14 @@ class LoginWorker:
             self.state = "checking"
             self.project_probe_counts.clear()
             self.project_probe_rpc_ids.clear()
+            try:
+                await self._require_no_manual_login_challenge()
+            except _ManualLoginChallenge:
+                self.state = "ready"
+                return {
+                    **self.public(), **self._manual_action_failure(),
+                    "is_logged_in": False, "has_flow_project": False,
+                }
             await self._stop_vnc()
             result: dict[str, Any]
             try:
@@ -752,6 +871,7 @@ class LoginWorker:
                             "is_logged_in": False, "has_flow_project": False,
                         }
                 initial = await self._validate_context_session("")
+                await self._require_no_manual_login_challenge()
                 checked = validate_google_cookies(
                     scoped_google_cookies(await self.context.cookies())
                 ) if initial.get("success") else initial
@@ -766,13 +886,17 @@ class LoginWorker:
                         )
                     except Exception:
                         pass
+                    await self._require_no_manual_login_challenge()
                 candidates = await self._refresh_project_documents() if checked.get("success") else set()
+                await self._require_no_manual_login_challenge()
                 if expected_project_id:
                     candidates &= {expected_project_id}
                     self.validation_candidate_ids = set(candidates)
                 if checked.get("success"):
                     await self._refresh_current_user_project_membership(candidates)
+                await self._require_no_manual_login_challenge()
                 final = await self._validate_context_session(identity)
+                await self._require_no_manual_login_challenge()
                 final_checked = validate_google_cookies(
                     scoped_google_cookies(await self.context.cookies())
                 ) if final.get("success") else final
@@ -815,6 +939,8 @@ class LoginWorker:
                             "identity": final_identity,
                             "project_id": project_id,
                         }
+            except _ManualLoginChallenge:
+                result = self._manual_action_failure()
             except Exception:
                 result = {"success": False, "error_code": "verification_unavailable",
                           "error": "worker 无法完成无成本检查；Profile 已保留"}
@@ -843,6 +969,16 @@ class LoginWorker:
             self.state = "checking"
             self.project_probe_counts.clear()
             self.project_probe_rpc_ids.clear()
+            try:
+                await self._require_no_manual_login_challenge()
+            except _ManualLoginChallenge:
+                self.state = "ready"
+                return {
+                    **self.public(), **self._manual_action_failure(),
+                    "is_logged_in": False,
+                    "has_account_projects": False,
+                    "existing_project_present": False,
+                }
             await self._stop_vnc()
             result: dict[str, Any]
             try:
@@ -857,6 +993,7 @@ class LoginWorker:
                 else:
                     result = {}
                 initial = await self._validate_context_session("") if not result else result
+                await self._require_no_manual_login_challenge()
                 checked = validate_google_cookies(
                     scoped_google_cookies(await self.context.cookies())
                 ) if initial.get("success") else initial
@@ -865,6 +1002,7 @@ class LoginWorker:
                 self.validation_candidate_ids.clear()
                 if checked.get("success"):
                     page = None
+                    keep_page_for_owner = False
                     try:
                         page = await self.context.new_page()
                         await page.goto(
@@ -872,19 +1010,25 @@ class LoginWorker:
                             wait_until="domcontentloaded",
                             timeout=90000,
                         )
+                        await self._require_no_manual_login_challenge()
                         for _ in range(40):
                             if self.provider_project_ids:
                                 break
                             await asyncio.sleep(0.25)
+                    except _ManualLoginChallenge:
+                        keep_page_for_owner = True
+                        raise
                     except Exception:
                         pass
                     finally:
-                        if page is not None:
+                        if page is not None and not keep_page_for_owner:
                             try:
                                 await page.close()
                             except Exception:
                                 pass
+                await self._require_no_manual_login_challenge()
                 final = await self._validate_context_session(identity)
+                await self._require_no_manual_login_challenge()
                 final_checked = validate_google_cookies(
                     scoped_google_cookies(await self.context.cookies())
                 ) if final.get("success") else final
@@ -912,6 +1056,8 @@ class LoginWorker:
                         "existing_project_present": bool(expected and expected in self.provider_project_ids),
                         "identity": final_identity,
                     }
+            except _ManualLoginChallenge:
+                result = self._manual_action_failure()
             except Exception:
                 result = failure("verification_unavailable", "worker 无法完成无成本检查；Profile 已保留")
             self.state = "ready"

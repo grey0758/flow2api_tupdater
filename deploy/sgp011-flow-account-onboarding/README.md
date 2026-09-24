@@ -6,6 +6,14 @@ password entry, TOTP/MFA, CAPTCHA, device confirmation, recovery challenges or
 consent. Those actions remain visible owner actions in the dedicated isolated
 VNC desktop.
 
+The login workers always launch Chromium with extensions disabled. They never
+install a CAPTCHA-solving extension or read/inject a solver key from OpenBao.
+The server-side image CAPTCHA provider is a separate runtime boundary and is
+not a Google-login mechanism. When a Google challenge is detected, the check
+returns only `manual_action_required`, retains the exact Profile and visible
+VNC, and performs no handoff, extraction or sync. The owner completes the
+challenge in that desktop, after which the same no-cost check can continue.
+
 The reusable pipeline is:
 
 1. Store each owner-supplied account as one versioned OpenBao KV v2 record.

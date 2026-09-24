@@ -143,6 +143,37 @@ def test_slot3_validation_returns_only_bounded_probe_diagnostics(monkeypatch):
     asyncio.run(exercise())
 
 
+def test_slot3_manual_challenge_keeps_ready_and_returns_only_action_flag(monkeypatch):
+    from test_login_slots import _keypair
+    module = _module(monkeypatch, _keypair()[0])
+
+    async def exercise():
+        module.sidecar.state = "ready"
+        call = AsyncMock(return_value={
+            "success": False,
+            "state": "ready",
+            "error_code": "manual_action_required",
+            "requires_manual_action": True,
+            "error": "private page detail",
+            "identity": "private@example.invalid",
+        })
+        monkeypatch.setattr(module.sidecar, "worker_call", call)
+
+        result = await module.sidecar.validate()
+
+        assert result == {
+            "success": False,
+            "state": "ready",
+            "has_identity": False,
+            "has_project": False,
+            "error_code": "manual_action_required",
+            "requires_manual_action": True,
+        }
+        assert "private" not in str(result)
+
+    asyncio.run(exercise())
+
+
 def test_slot3_existing_project_validation_forwards_only_to_worker(monkeypatch):
     from test_login_slots import _keypair
     module = _module(monkeypatch, _keypair()[0])

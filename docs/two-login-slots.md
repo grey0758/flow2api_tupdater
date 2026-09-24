@@ -48,6 +48,10 @@ fields beside the invitation URLs in one exact notification.
    context. It validates Labs session, credits and complete Cookies before it
    binds a project observed in the same context. A failed check returns the
    same private desktop to the same owner; a successful check closes it.
+   If Google presents CAPTCHA, 2-Step Verification, device confirmation or
+   account recovery, the check returns `manual_action_required`, keeps the
+   same Profile/VNC open and performs no handoff, extraction or sync. The
+   owner completes that challenge visibly before another no-cost check.
 6. The administrator applies the rest of the accepted serial process: at most
    one `extract`, local identity/project deduplication, online Updater
    and Flow SQLite backups plus the read-only NewAPI boundary, exactly one
@@ -76,7 +80,10 @@ that separate proof is available.
   other Profiles, the Docker socket or administrator secrets. Their one RW
   persistent mount each is its own named Profile volume. Runtime control and
   fixed-proxy egress are separate Unix sockets; workers use `network:none`
-  and keep the Chromium sandbox enabled.
+  and keep the Chromium sandbox enabled. Chromium extensions are disabled;
+  do not install a CAPTCHA-solving extension or inject a solver key into a
+  login Profile. Server-side image CAPTCHA solving is an unrelated runtime
+  boundary and cannot be reused for Google account login.
 - The control plane alone publishes the management port on host loopback.
   Nginx must explicitly proxy Upgrade on
   `/login-slots/vnc/websockify?slot=N`; the FastAPI route binds the signed

@@ -203,6 +203,12 @@ class Sidecar:
                     "has_project": bool(self.project_id),
                     "error_code": self.last_error or None,
                 }
+                if (
+                    not accepted
+                    and result.get("requires_manual_action") is True
+                    and self.last_error == "manual_action_required"
+                ):
+                    response["requires_manual_action"] = True
                 if not accepted:
                     # Expose only bounded classifier telemetry needed to
                     # distinguish an absent provider response from a changed
@@ -331,7 +337,7 @@ class Sidecar:
                         self.last_error = "incomplete_handoff_evidence"
                         self.identity = ""
                         accepted = False
-                return {
+                response = {
                     "success": accepted,
                     "state": self.state,
                     "has_identity": bool(self.identity),
@@ -339,6 +345,13 @@ class Sidecar:
                     "existing_project_present": bool(result.get("existing_project_present")),
                     "error_code": self.last_error or None,
                 }
+                if (
+                    not accepted
+                    and result.get("requires_manual_action") is True
+                    and self.last_error == "manual_action_required"
+                ):
+                    response["requires_manual_action"] = True
+                return response
             except Exception as exc:
                 async with self.lock:
                     self.state = "quarantined"
