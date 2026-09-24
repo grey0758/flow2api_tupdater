@@ -14,6 +14,7 @@ _ACTION_LABELS = {
     "export_cookies": "导出 Cookie",
     "extract_token": "提取会话令牌",
     "sync_profile": "同步账号",
+    "onboard_profile": "绑定新账号",
     "sync_all": "同步全部账号",
     "delete_profile": "删除账号",
 }

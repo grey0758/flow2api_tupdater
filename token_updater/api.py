@@ -652,6 +652,10 @@ class ImportAccountsRequest(BaseModel):
     update_existing: bool = True
 
 
+class OnboardingSyncRequest(BaseModel):
+    backup_confirmed: bool = False
+
+
 def _normalize_cookie_export_kind(kind: str | None) -> str:
     normalized = str(kind or "google").strip().lower()
     if normalized in {"session", "labs"}:
@@ -1485,6 +1489,34 @@ async def sync_profile(profile_id: int, token: str = Depends(verify_session)):
         {"profile_id": profile_id, "success": bool(result.get("success"))},
     )
     return result
+
+
+@app.post("/api/profiles/{profile_id}/onboarding-sync")
+async def onboarding_sync_profile(
+    profile_id: int,
+    request: OnboardingSyncRequest,
+    token: str = Depends(verify_session),
+):
+    """Bind one fresh validated identity once, leaving both sides disabled."""
+    result = await token_syncer.onboard_new_profile_once(
+        profile_id,
+        backup_confirmed=bool(request.backup_confirmed),
+    )
+    safe_keys = (
+        "success",
+        "action",
+        "oauth_verified",
+        "project_context_accepted",
+        "project_reused",
+        "project_owned",
+        "pending_enable",
+        "account_active",
+        "needs_refresh",
+        "token_id",
+        "error_code",
+        "pending_image_acceptance",
+    )
+    return {key: result.get(key) for key in safe_keys if key in result}
 
 
 @app.post("/api/sync-all")

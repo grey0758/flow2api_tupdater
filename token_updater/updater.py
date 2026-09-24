@@ -371,6 +371,129 @@ class TokenSyncer:
             ):
                 return await self._sync_profile(profile_id)
 
+    async def onboard_new_profile_once(
+        self,
+        profile_id: int,
+        *,
+        backup_confirmed: bool,
+    ) -> Dict[str, Any]:
+        """Perform the sole receiver write for a fresh login-slot identity.
+
+        The host-side operator owns identity/project deduplication and the two
+        online SQLite backups.  This in-process step closes the scheduler race:
+        activation and the one sync share both the sync lock and execution
+        gate.  The source Profile is deactivated again before returning so a
+        pending destination token cannot be resubmitted every scheduler tick.
+        """
+        if not backup_confirmed:
+            return failure(
+                "onboarding_backup_unconfirmed",
+                "未确认写前 SQLite 备份；禁止绑定新账号",
+            )
+        from .login_slots import login_slots
+        if login_slots.owns(profile_id):
+            return failure(
+                "onboarding_handoff_incomplete",
+                "Profile 仍在独立登录槽位中；请先完成无成本检查",
+            )
+
+        async with self._sync_lock:
+            profile = await profile_db.get_profile(profile_id)
+            profile_name = profile.get("name", "") if profile else ""
+            async with execution_gate.hold(
+                "onboard_profile",
+                profile_id=profile_id,
+                profile_name=profile_name,
+                source="onboarding",
+            ):
+                profile = await profile_db.get_profile(profile_id)
+                if not profile:
+                    return failure("onboarding_profile_missing", "Profile 不存在")
+                identity = self._normalize_email(profile.get("email"))
+                project_identity = self._normalize_email(
+                    profile.get("observed_flow_project_identity")
+                )
+                project_id = self._normalize_project_id(
+                    profile.get("observed_flow_project_id")
+                )
+                ready = bool(
+                    not profile.get("is_active")
+                    and profile.get("is_logged_in")
+                    and int(profile.get("sync_count") or 0) == 0
+                    and int(profile.get("error_count") or 0) == 0
+                    and profile.get("login_slot_claimed")
+                    and profile.get("login_slot_handoff_complete")
+                    and profile.get("observed_flow_project_verified")
+                    and identity
+                    and project_identity == identity
+                    and project_id
+                    and profile.get("last_token")
+                    and validate_google_cookies(
+                        scoped_google_cookies(profile.get("google_cookies"))
+                    ).get("success")
+                )
+                if not ready:
+                    return failure(
+                        "onboarding_not_ready",
+                        "Profile 未满足新账号单次绑定前提；未向目标写入",
+                    )
+
+                flow2api_url, connection_token = self._resolve_target(profile)
+                checked = await self._check_tokens_status(
+                    flow2api_url,
+                    connection_token,
+                    [identity],
+                )
+                if not checked.get("success"):
+                    return checked
+                matches = [
+                    item for item in checked.get("tokens", [])
+                    if self._normalize_email(item.get("email")) == identity
+                ]
+                if matches:
+                    return failure(
+                        "onboarding_identity_duplicate",
+                        "目标已存在该身份；新账号流程已停止",
+                    )
+
+                await profile_db.update_profile(
+                    profile_id,
+                    is_active=1,
+                    login_slot_prepared=0,
+                )
+                try:
+                    result = await self._sync_profile(profile_id)
+                finally:
+                    # A newly inserted destination account remains pending and
+                    # must not be touched by the five-minute scheduler until
+                    # independent image acceptance and explicit enablement.
+                    await profile_db.update_profile(profile_id, is_active=0)
+
+                accepted = bool(
+                    result.get("success")
+                    and result.get("action") == "added_pending_enable"
+                    and result.get("oauth_verified") is True
+                    and result.get("project_context_accepted") is True
+                    and result.get("project_reused") is True
+                    and result.get("project_owned") is True
+                    and result.get("pending_enable") is True
+                    and result.get("account_active") is False
+                    and result.get("needs_refresh") is False
+                    and isinstance(result.get("token_id"), int)
+                )
+                if not accepted:
+                    return {
+                        **failure(
+                            "onboarding_sync_contract_failed",
+                            "目标未完整确认 pending 新账号；Profile 已暂停，禁止重试",
+                        ),
+                        "synced": bool(result.get("synced") or result.get("success")),
+                    }
+                return {
+                    **result,
+                    "pending_image_acceptance": True,
+                }
+
     async def _sync_profile(self, profile_id: int) -> Dict[str, Any]:
         """同步单个 Profile。"""
         from .login_slots import login_slots
