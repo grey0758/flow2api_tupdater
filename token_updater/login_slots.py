@@ -220,11 +220,24 @@ class LoginSlots:
             data = response.json()
             if not isinstance(data, dict):
                 raise RuntimeError(f"worker {method} returned an invalid response")
-            if (
-                data.get("slot") != slot.number
-                or data.get("generation") != slot.generation
-                or data.get("profile_id") != slot.profile_id
-            ):
+            exact_scope = bool(
+                data.get("slot") == slot.number
+                and data.get("generation") == slot.generation
+                and data.get("profile_id") == slot.profile_id
+            )
+            # A successful abort deliberately clears the worker assignment
+            # before returning its public state.  Accept only that exact
+            # terminal shape on the signed, slot-specific UDS request; every
+            # other worker method must still echo the original scope.
+            cleared_abort_scope = bool(
+                method == "abort"
+                and data.get("slot") == slot.number
+                and data.get("generation") == ""
+                and data.get("profile_id") == 0
+                and data.get("state") in {"idle", "quarantined"}
+                and data.get("browser_running") is False
+            )
+            if not (exact_scope or cleared_abort_scope):
                 raise RuntimeError("worker response scope does not match")
             return data
         except Exception as exc:

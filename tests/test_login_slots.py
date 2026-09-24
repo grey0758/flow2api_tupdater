@@ -80,6 +80,69 @@ def _worker_reply(slot, state="ready", browser=True, **extra):
     }
 
 
+def test_abort_response_accepts_only_cleared_terminal_scope(monkeypatch):
+    from token_updater import login_slots as module
+
+    slot = LoginSlot(
+        number=1,
+        profile_id=77,
+        capability="capability",
+        expires_at=time.time() + 60,
+        worker_socket="/worker.sock",
+        generation="generation",
+    )
+    monkeypatch.setattr(
+        LoginSlots,
+        "_signed_headers",
+        classmethod(lambda cls, *args, **kwargs: {}),
+    )
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        def __init__(self, payload, *args, **kwargs):
+            self.payload = payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            return Response(self.payload)
+
+    cleared = {
+        "slot": 1,
+        "generation": "",
+        "profile_id": 0,
+        "state": "quarantined",
+        "browser_running": False,
+    }
+    monkeypatch.setattr(module.httpx, "AsyncClient", lambda *a, **k: Client(cleared))
+    assert asyncio.run(LoginSlots._worker(slot, "abort")) == cleared
+
+    for invalid in (
+        {**cleared, "slot": 2},
+        {**cleared, "state": "ready"},
+        {**cleared, "browser_running": True},
+    ):
+        monkeypatch.setattr(module.httpx, "AsyncClient", lambda *a, _p=invalid, **k: Client(_p))
+        with pytest.raises(RuntimeError, match="abort failed"):
+            asyncio.run(LoginSlots._worker(slot, "abort"))
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", lambda *a, **k: Client(cleared))
+    with pytest.raises(RuntimeError, match="validate failed"):
+        asyncio.run(LoginSlots._worker(slot, "validate"))
+
+
 @pytest.mark.asyncio
 async def test_two_profiles_get_distinct_workers(monkeypatch, tmp_path):
     from token_updater.browser import browser_manager
