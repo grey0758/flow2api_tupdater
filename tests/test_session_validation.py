@@ -23,9 +23,16 @@ def session(**changes):
 
 
 @pytest.mark.parametrize("expires", [None, "", "not-a-date", 123, "2026-09-08T12:07:17Z",
-                                    "2026-09-09T00:00:30Z", "2026-09-09T08:00:00+08:00"])
+                                    "2026-09-09T00:00:30Z", "2026-09-09T01:05:00Z",
+                                    "2026-09-09T08:00:00+08:00"])
 def test_missing_expired_or_about_to_expire_session_is_rejected(expires):
     assert validate_labs_session(session(expires=expires), now=NOW)["error_code"] == "auth_required"
+
+
+def test_session_with_destination_refresh_headroom_is_accepted():
+    assert validate_labs_session(
+        session(expires="2026-09-09T01:05:01Z"), now=NOW
+    )["success"]
 
 
 @pytest.mark.parametrize("payload", [None, [], {}, session(access_token=""), session(user={}), session(error="RefreshAccessTokenError")])

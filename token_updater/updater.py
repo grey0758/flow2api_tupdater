@@ -120,6 +120,9 @@ class TokenSyncer:
         token_lookup: Dict[str, Dict[str, Any]],
         now: Optional[datetime] = None,
     ) -> Tuple[bool, str]:
+        if profile.get("is_logged_in") in (False, 0):
+            return False, "源 Profile 已标记为未登录，需要管理员检查保留浏览器"
+
         email = self._normalize_email(profile.get("email"))
         if not email:
             return True, "未识别邮箱，无法精确检查上游状态"

@@ -6,6 +6,36 @@ from token_updater.updater import TokenSyncer
 
 
 class TokenSyncerBatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_logged_out_profile_is_skipped_before_destination_or_browser(self):
+        syncer = TokenSyncer()
+        profile = {
+            "id": 9,
+            "name": "retained",
+            "email": "retained@example.com",
+            "is_logged_in": False,
+            "flow2api_url": "http://example.com",
+            "connection_token_override": "token-9",
+        }
+        with (
+            patch("token_updater.updater.profile_db.get_active_profiles", AsyncMock(return_value=[profile])),
+            patch("token_updater.updater.profile_db.update_profile", AsyncMock()),
+            patch("token_updater.updater.profile_db.record_sync_event", AsyncMock()),
+            patch("token_updater.updater.dashboard_events.publish", AsyncMock()),
+            patch.object(syncer, "_check_tokens_status", AsyncMock(return_value={
+                "success": True,
+                "tokens": [{
+                    "email": profile["email"],
+                    "is_active": True,
+                    "needs_refresh": True,
+                }],
+            })),
+            patch.object(syncer, "_sync_profile", AsyncMock()) as sync_profile,
+        ):
+            result = await syncer.sync_all_profiles(source="scheduled")
+        sync_profile.assert_not_awaited()
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["error_count"], 0)
+
     async def test_protected_inactive_overdue_profile_is_skipped_before_source_login(self):
         syncer = TokenSyncer()
         profile = {"id":7, "name":"independent", "email":"independent@example.com",

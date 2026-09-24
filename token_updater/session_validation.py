@@ -9,6 +9,11 @@ LABS_SESSION_URL = "https://labs.google/fx/api/auth/session"
 LABS_CSRF_URL = "https://labs.google/fx/api/auth/csrf"
 LABS_SIGNIN_URL = "https://labs.google/fx/api/auth/signin/google"
 CREDITS_URL = "https://aisandbox-pa.googleapis.com/v1/credits"
+# Flow2API starts treating an AT as refresh-needed below one hour.  The source
+# browser must require a slightly larger window so network and destination
+# readback time cannot turn an accepted extraction into an immediate
+# post-write rejection.
+MIN_PROVIDER_SESSION_REMAINING = timedelta(minutes=65)
 
 
 def failure(code: str, message: str) -> dict:
@@ -26,7 +31,7 @@ def validate_labs_session(data: Any, expected_email: str = "", *, now=None) -> d
         expires = datetime.fromisoformat(data["expires"].replace("Z", "+00:00"))
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=timezone.utc)
-        if expires <= (now or datetime.now(timezone.utc)) + timedelta(seconds=60):
+        if expires <= (now or datetime.now(timezone.utc)) + MIN_PROVIDER_SESSION_REMAINING:
             return invalid
     except (KeyError, TypeError, ValueError, AttributeError):
         return invalid
