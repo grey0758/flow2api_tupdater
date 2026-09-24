@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -122,6 +123,25 @@ def require_fresh_candidate(state: dict[str, Any], *, extracted: bool) -> None:
         raise OperatorError(
             "candidate_not_validated",
             "Profile 尚未完成同身份项目验证和会话提取；未向目标写入",
+        )
+
+
+def require_expected_identity(
+    state: dict[str, Any], expected_identity: str | None
+) -> None:
+    """Bind a candidate to the owner-selected inventory record without logging it."""
+    if expected_identity is None:
+        return
+    expected = expected_identity.strip().casefold()
+    observed = str(state.get("identity") or "").strip().casefold()
+    if not expected or len(expected) > 320 or "\n" in expected or "\r" in expected:
+        raise OperatorError(
+            "expected_identity_invalid", "预期身份格式无效；未向目标写入"
+        )
+    if not observed or not secrets.compare_digest(observed, expected):
+        raise OperatorError(
+            "unexpected_identity",
+            "当前 Profile 身份与指定库存记录不一致；未向目标写入",
         )
 
 
@@ -376,9 +396,13 @@ def write_outcome(backup_dir: Path, name: str, payload: dict[str, Any]) -> None:
     os.chmod(path, 0o600)
 
 
-def run(profile_id: int) -> dict[str, Any]:
+def run(
+    profile_id: int, expected_identity: str | None = None
+) -> dict[str, Any]:
     before = profile_state(profile_id)
     require_fresh_candidate(before, extracted=False)
+    if before["identity"]:
+        require_expected_identity(before, expected_identity)
 
     if not (
         before["handoff_complete"]
@@ -397,11 +421,14 @@ def run(profile_id: int) -> dict[str, Any]:
             )
 
     state = profile_state(profile_id)
+    if state["identity"]:
+        require_expected_identity(state, expected_identity)
     if not (state["token_present"] and state["cookies_present"]):
         extracted = updater_call("extract", profile_id)
         if not (extracted.get("success") and extracted.get("token_present")):
             raise OperatorError("extract_failed", "浏览器会话提取失败；未向目标写入")
         state = profile_state(profile_id)
+    require_expected_identity(state, expected_identity)
     require_fresh_candidate(state, extracted=True)
 
     dedupe = dedupe_state(state)
@@ -449,6 +476,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Bind one completed sgp011 Flow login and stop pending image acceptance"
     )
+    parser.add_argument(
+        "--expected-identity-stdin",
+        action="store_true",
+        help="read the expected inventory identity from stdin without logging it",
+    )
     parser.add_argument("profile_id", nargs="?", type=int)
     args = parser.parse_args()
     if os.geteuid() != 0:
@@ -463,7 +495,15 @@ def main() -> int:
             return 1
         try:
             profile_id = select_profile_id(args.profile_id)
-            result = run(profile_id)
+            expected_identity = None
+            if args.expected_identity_stdin:
+                expected_identity = sys.stdin.readline(322)
+                if not expected_identity.endswith("\n") or len(expected_identity) > 321:
+                    raise OperatorError(
+                        "expected_identity_invalid", "预期身份输入格式无效；未向目标写入"
+                    )
+                expected_identity = expected_identity.rstrip("\r\n")
+            result = run(profile_id, expected_identity)
             print(json.dumps({"success": True, **result}, sort_keys=True))
             return 0
         except OperatorError as exc:

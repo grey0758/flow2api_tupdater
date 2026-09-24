@@ -167,6 +167,27 @@ def safe_record(record_id: str, data: dict[str, Any], version: int) -> dict[str,
     }
 
 
+def require_record_binding(
+    record_id: str,
+    data: dict[str, Any],
+    *,
+    status: str,
+    profile_id: int,
+    token_id: int | None = None,
+) -> str:
+    """Fail before a remote mutation if a stage targets the wrong inventory row."""
+    if data.get("RECORD_ID") != record_id or data.get("STATUS") != status:
+        raise PipelineError("record_stage_mismatch")
+    if str(data.get("PROFILE_ID") or "") != str(profile_id):
+        raise PipelineError("record_profile_mismatch")
+    if token_id is not None and str(data.get("FLOW_TOKEN_ID") or "") != str(token_id):
+        raise PipelineError("record_token_mismatch")
+    identity = str(data.get("EMAIL") or "").strip()
+    if not identity or len(identity) > 320 or "\n" in identity or "\r" in identity:
+        raise PipelineError("record_identity_invalid")
+    return identity
+
+
 def command_status(_: argparse.Namespace) -> dict[str, Any]:
     bao = OpenBao()
     records = []
@@ -330,13 +351,24 @@ def command_prepare_invite(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_onboard(args: argparse.Namespace) -> dict[str, Any]:
     record_id = validate_record_id(args.record_id)
+    bao = OpenBao()
+    data, _ = bao.get(record_id)
+    expected_identity = require_record_binding(
+        record_id,
+        data,
+        status="login_invited",
+        profile_id=args.profile_id,
+    )
     result = run(
         [
             "ssh-1p", "sgp011", "sudo",
-            "/usr/local/sbin/sgp011-flow-onboard-profile", str(args.profile_id),
+            "/usr/local/sbin/sgp011-flow-onboard-profile",
+            "--expected-identity-stdin", str(args.profile_id),
         ],
+        input_text=expected_identity + "\n",
         timeout=900,
     )
+    expected_identity = ""
     reply = parse_last_json(result.stdout)
     if result.returncode or reply.get("success") is not True:
         raise PipelineError(str(reply.get("error_code") or "onboard_failed_no_retry"))
@@ -344,7 +376,6 @@ def command_onboard(args: argparse.Namespace) -> dict[str, Any]:
         reply.get("token_id"), int
     ):
         raise PipelineError("onboard_pending_contract_failed")
-    bao = OpenBao()
     version = bao.update(
         record_id,
         {
@@ -367,6 +398,15 @@ def command_onboard(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_accept(args: argparse.Namespace) -> dict[str, Any]:
     record_id = validate_record_id(args.record_id)
+    bao = OpenBao()
+    data, _ = bao.get(record_id)
+    require_record_binding(
+        record_id,
+        data,
+        status="pending_image_acceptance",
+        profile_id=args.profile_id,
+        token_id=args.token_id,
+    )
     result = run(
         [
             "ssh-1p", "sgp011", "sudo",
@@ -389,7 +429,6 @@ def command_accept(args: argparse.Namespace) -> dict[str, Any]:
     if reply.get("mode") != "pending_image_acceptance" or len(matches) != 1:
         raise PipelineError("image_acceptance_contract_failed")
     item = matches[0]
-    bao = OpenBao()
     version = bao.update(
         record_id,
         {"STATUS": "image_accepted", "IMAGE_ACCEPTED_AT": utc_now()},
@@ -510,6 +549,15 @@ print(json.dumps({"success": True, "profile_id": profile_id, "flow_token_id": to
 
 def command_enable(args: argparse.Namespace) -> dict[str, Any]:
     record_id = validate_record_id(args.record_id)
+    bao = OpenBao()
+    data, _ = bao.get(record_id)
+    require_record_binding(
+        record_id,
+        data,
+        status="image_accepted",
+        profile_id=args.profile_id,
+        token_id=args.token_id,
+    )
     result = run(
         ["ssh-1p", "sgp011", "sudo", "python3", "-", str(args.profile_id), str(args.token_id)],
         input_text=ENABLE_HELPER,
@@ -518,7 +566,6 @@ def command_enable(args: argparse.Namespace) -> dict[str, Any]:
     reply = parse_last_json(result.stdout)
     if result.returncode or reply.get("success") is not True:
         raise PipelineError("explicit_enable_failed")
-    bao = OpenBao()
     version = bao.update(
         record_id,
         {"STATUS": "imported", "ENABLED_AT": utc_now()},

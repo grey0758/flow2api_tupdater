@@ -57,3 +57,10 @@ pending token. `accept` is the one explicitly selected paid image. `enable`
 requires a unique completed pending-image evidence directory before changing
 the token/Profile pair and compensates by disabling the token if Profile
 enablement fails.
+
+Every mutating stage first requires the exact OpenBao state transition and
+record-to-Profile-to-Token binding. `onboard` additionally passes the expected
+inventory identity only over stdin to the guarded host command; the host
+compares it in memory after the no-cost browser check/extraction and before
+backup or receiver sync. A wrong Google identity therefore stops without
+creating a Flow token, while neither expected nor observed identity is logged.

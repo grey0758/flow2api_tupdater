@@ -51,6 +51,27 @@ def test_candidate_requires_stable_identity_project_and_extraction():
             module.require_fresh_candidate(changed, extracted=True)
 
 
+def test_expected_identity_mismatch_stops_without_disclosing_values():
+    with pytest.raises(module.OperatorError) as raised:
+        module.require_expected_identity(state(), "different@example.com")
+    assert raised.value.code == "unexpected_identity"
+    assert "fresh@example.com" not in raised.value.message
+    assert "different@example.com" not in raised.value.message
+
+
+def test_run_stops_wrong_inventory_identity_before_backup_or_sync():
+    with (
+        patch.object(module, "profile_state", return_value=state()),
+        patch.object(module, "online_backup") as backup,
+        patch.object(module, "updater_call") as api,
+    ):
+        with pytest.raises(module.OperatorError) as raised:
+            module.run(19, "different@example.com")
+    assert raised.value.code == "unexpected_identity"
+    backup.assert_not_called()
+    api.assert_not_called()
+
+
 def test_run_stops_duplicate_before_backup_or_sync():
     with (
         patch.object(module, "profile_state", return_value=state()),

@@ -50,6 +50,38 @@ def test_safe_record_excludes_provider_credentials():
     }
 
 
+def test_record_binding_requires_exact_stage_profile_and_token():
+    record = {
+        "RECORD_ID": "account-001",
+        "STATUS": "pending_image_acceptance",
+        "PROFILE_ID": "18",
+        "FLOW_TOKEN_ID": "21",
+        "EMAIL": "owner@example.invalid",
+    }
+    assert MODULE.require_record_binding(
+        "account-001",
+        record,
+        status="pending_image_acceptance",
+        profile_id=18,
+        token_id=21,
+    ) == "owner@example.invalid"
+    for field, value, code in (
+        ("STATUS", "login_invited", "record_stage_mismatch"),
+        ("PROFILE_ID", "19", "record_profile_mismatch"),
+        ("FLOW_TOKEN_ID", "22", "record_token_mismatch"),
+    ):
+        changed = dict(record, **{field: value})
+        with pytest.raises(MODULE.PipelineError) as raised:
+            MODULE.require_record_binding(
+                "account-001",
+                changed,
+                status="pending_image_acceptance",
+                profile_id=18,
+                token_id=21,
+            )
+        assert raised.value.code == code
+
+
 def test_cli_has_no_plaintext_password_argument():
     source = SCRIPT.read_text(encoding="utf-8")
     assert '"--basic-password-stdin"' in source
@@ -57,6 +89,7 @@ def test_cli_has_no_plaintext_password_argument():
     assert "pyotp" not in source
     assert "xdotool" not in source
     assert "playwright" not in source
+    assert '"--expected-identity-stdin"' in source
 
 
 def test_invitation_requires_exact_256_bit_urlsafe_capability():
