@@ -1,0 +1,8 @@
+ARG BASE_IMAGE=flow2api-token-updater-control:session-durability-onboard-20260924
+FROM ${BASE_IMAGE}
+
+COPY login_slots.py /app/token_updater/login_slots.py
+
+RUN python -m py_compile /app/token_updater/login_slots.py \
+    && chmod 0644 /app/token_updater/login_slots.py
+

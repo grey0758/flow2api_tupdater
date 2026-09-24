@@ -32,6 +32,11 @@ Flow2API Token Updater 是一个轻量级的多账号令牌刷新工具。
 并发登录的操作与安全边界见
 [Two concurrent owner-login slots](docs/two-login-slots.md)。管理员登录后可从
 控制台进入 `/account-import`。邀请页面不提供同步、Cookie 导出或账号启用能力。
+
+sgp011 的 OpenBao 批量导入、邀请、去重、单次同步、独立图片验收与显式启用
+由 [生产账号导入流水线](deploy/sgp011-flow-account-onboarding/README.md) 分阶段执行。
+该流水线刻意不读取或自动填写 Google 密码、TOTP/MFA，也不处理 CAPTCHA、设备
+确认、恢复挑战或 consent；这些步骤始终由账号 owner 在独立 VNC 中可见完成。
 - 仪表盘定时轮询：避免将管理员会话放入 SSE URL 和访问日志
 - 图表范围切换：6 小时 / 24 小时 / 72 小时 / 7 天
 - 内置分析：同步活动、失败原因、目标实例分布

@@ -1,0 +1,4 @@
+services:
+  token-updater:
+    image: flow2api-token-updater-control:login-slot-reconcile-20260924
+
