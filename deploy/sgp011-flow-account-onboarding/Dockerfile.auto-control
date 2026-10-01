@@ -1,0 +1,12 @@
+ARG BASE_IMAGE=flow2api-token-updater-control:vnc-web-20260926
+FROM ${BASE_IMAGE}
+
+# Overlay only control-plane files. The accepted browser/extension and
+# scheduler modules stay byte-identical to the production base image.
+COPY token_updater/api.py token_updater/config.py token_updater/database.py \
+     token_updater/login_slots.py token_updater/account_auto_login_remote.py \
+     /app/token_updater/
+RUN python -m py_compile \
+    /app/token_updater/api.py /app/token_updater/config.py \
+    /app/token_updater/database.py /app/token_updater/login_slots.py \
+    /app/token_updater/account_auto_login_remote.py

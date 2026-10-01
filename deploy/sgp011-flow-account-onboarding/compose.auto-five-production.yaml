@@ -1,0 +1,19 @@
+# Apply last, after the current production v3.4 overlays and
+# docker-compose.login-slots-five.yml. Never use with docker compose down -v.
+services:
+  slot-volume-init:
+    image: flow2api-token-updater-login-worker:secure-final
+  login-egress-3:
+    image: flow2api-token-updater-login-worker:secure-final
+  login-egress-4:
+    image: flow2api-token-updater-login-worker:secure-final
+  login-egress-5:
+    image: flow2api-token-updater-login-worker:secure-final
+  login-worker-3:
+    image: flow2api-token-updater-login-worker-core3:auto-five-r2-20261001
+  login-worker-4:
+    image: flow2api-token-updater-login-worker-core4:auto-five-r2-20261001
+  login-worker-5:
+    image: flow2api-token-updater-login-worker-core5:auto-five-r2-20261001
+  token-updater:
+    image: flow2api-token-updater-control:auto-five-20261001

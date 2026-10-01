@@ -27,6 +27,8 @@ x-auto-egress: &auto-egress
   cap_drop: [ALL]
   security_opt: [no-new-privileges:true]
   user: "12001:12000"
+  environment:
+    LOGIN_EGRESS_PORT: "18089"
   mem_limit: 128m
   pids_limit: 64
   cpus: 0.25

@@ -96,6 +96,20 @@ def test_five_slot_configuration_keeps_independent_worker_sockets(monkeypatch):
     assert len(set(module.config.login_slot_worker_sockets)) == 5
 
 
+def test_new_worker_slots_and_project_list_probe_are_supported(monkeypatch):
+    monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
+    monkeypatch.setenv("LOGIN_SLOT_NUMBER", "3")
+    from token_updater import login_worker as module
+    from token_updater.login_worker_protocol import ReplayGuard
+    monkeypatch.setattr(module, "PUBLIC_KEY", _keypair()[1])
+    for number in (3, 4, 5):
+        monkeypatch.setattr(module, "SLOT_NUMBER", number)
+        worker = module.LoginWorker()
+        assert isinstance(worker.guard, ReplayGuard)
+        worker._probe_count("user_list_success_envelope")
+        assert worker.project_probe_counts["user_list_success_envelope"] == 1
+
+
 def test_bound_quarantined_profiles_leave_other_slots_free(monkeypatch):
     from token_updater import login_slots as module
     monkeypatch.setattr(module.config, "login_slot_worker_ids", (11001, 11002, 11004, 11005, 11006))

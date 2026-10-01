@@ -262,7 +262,7 @@ def _uuid_values(value: Any) -> set[str]:
 
 class LoginWorker:
     def __init__(self) -> None:
-        if not PUBLIC_KEY or SLOT_NUMBER not in {1, 2, 3}:
+        if not PUBLIC_KEY or SLOT_NUMBER not in range(1, 6):
             raise RuntimeError("worker public key and slot number are required")
         self.guard = ReplayGuard(PUBLIC_KEY, SLOT_NUMBER)
         self.lock = asyncio.Lock()
@@ -284,6 +284,7 @@ class LoginWorker:
         if key in {
             "flow_rpc_post", "rpc_ids_known", "rpc_ids_other",
             "known_status_200", "known_content_type", "known_success_envelope",
+            "user_list_success_envelope",
             "scoped_candidate_match", "user_list_candidate_match",
         }:
             self.project_probe_counts[key] = min(999, self.project_probe_counts.get(key, 0) + 1)
