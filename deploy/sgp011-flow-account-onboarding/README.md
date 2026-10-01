@@ -6,8 +6,11 @@ password entry, TOTP/MFA, CAPTCHA, device confirmation, recovery challenges or
 consent. Those actions remain visible owner actions in the dedicated isolated
 VNC desktop.
 
-The login workers always launch Chromium with extensions disabled. They never
-install a CAPTCHA-solving extension or read/inject a solver key from OpenBao.
+The login workers launch headed Chromium with the pinned YesCaptcha Assistant
+Manifest V3 extension from their separate read-only `/slot-extension` mounts.
+The main VNC browser uses `/vnc-extension`. A missing extension fails closed
+on deployed workers. Future Profiles inherit the extension when they launch
+in a slot. The workers never read/inject a solver key from OpenBao.
 The server-side image CAPTCHA provider is a separate runtime boundary and is
 not a Google-login mechanism. When a Google challenge is detected, the check
 returns only `manual_action_required`, retains the exact Profile and visible
@@ -52,15 +55,15 @@ their risk boundaries:
 
 ```text
 sgp011_flow_account_pipeline.py status
-sgp011_flow_account_pipeline.py prepare-invite --record-id account-NNN --profile-name <NAME> --basic-password-stdin
+sgp011_flow_account_pipeline.py prepare-invite --record-id account-NNN --profile-name <NAME>
 sgp011_flow_account_pipeline.py onboard --record-id account-NNN --profile-id <PROFILE_ID>
 sgp011_flow_account_pipeline.py accept --record-id account-NNN --profile-id <PROFILE_ID> --token-id <FLOW_TOKEN_ID>
 sgp011_flow_account_pipeline.py enable --record-id account-NNN --profile-id <PROFILE_ID> --token-id <FLOW_TOKEN_ID>
 ```
 
-`prepare-invite` reads the established VNC Basic Auth password from a hidden
-prompt or stdin and pipes the complete notification directly to the approved
-sender. It does not accept a password argument. `onboard` stops at a disabled
+`prepare-invite` sends a one-time token link directly to the approved sender.
+The invitee enters the scoped VNC without a separate username or password.
+`onboard` stops at a disabled
 pending token. `accept` is the one explicitly selected paid image. `enable`
 requires a unique completed pending-image evidence directory before changing
 the token/Profile pair and compensates by disabling the token if Profile

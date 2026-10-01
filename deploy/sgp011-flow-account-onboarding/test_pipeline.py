@@ -1,4 +1,7 @@
 import importlib.util
+import json
+import subprocess
+import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -84,7 +87,7 @@ def test_record_binding_requires_exact_stage_profile_and_token():
 
 def test_cli_has_no_plaintext_password_argument():
     source = SCRIPT.read_text(encoding="utf-8")
-    assert '"--basic-password-stdin"' in source
+    assert '"--basic-password-stdin"' not in source
     assert '"--password"' not in source
     assert "pyotp" not in source
     assert "xdotool" not in source
@@ -101,3 +104,41 @@ def test_invitation_requires_exact_256_bit_urlsafe_capability():
 def test_embedded_remote_helpers_are_valid_python():
     compile(MODULE.PREPARE_HELPER, "<prepare-helper>", "exec")
     compile(MODULE.ENABLE_HELPER, "<enable-helper>", "exec")
+    compile(MODULE.ACCEPTANCE_EVIDENCE_HELPER, "<acceptance-evidence-helper>", "exec")
+
+
+def test_completed_image_report_is_reconciled_without_a_second_request(tmp_path):
+    folder = tmp_path / "sgp011-flow-account-health-test"
+    folder.mkdir()
+    (folder / "COMPLETE").touch()
+    report = {
+        "success": True,
+        "mode": "pending_image_acceptance",
+        "results": [{
+            "success": True, "stage": "complete", "profile_id": 54,
+            "flow_token_id": 43, "newapi_http": 200, "media_http": 200,
+            "image_format": "JPEG", "width": 1376, "height": 768,
+            "bytes": 405251, "flow_log_id": 24635, "newapi_log_id": 52900,
+            "newapi_log_rows": 1,
+        }],
+    }
+    (folder / "result.json").write_text(json.dumps(report))
+    helper = MODULE.ACCEPTANCE_EVIDENCE_HELPER.replace(
+        "/home/grey/backups/sgp011-flow-account-health-*", str(tmp_path / "sgp011-flow-account-health-*")
+    )
+    completed = subprocess.run(
+        [sys.executable, "-", "54", "43"], input=helper, text=True,
+        capture_output=True, check=False,
+    )
+    assert completed.returncode == 0
+    evidence = json.loads(completed.stdout)
+    assert evidence["evidence"] == folder.name
+    assert evidence["results"][0]["flow_log_id"] == 24635
+
+    report["results"][0]["media_http"] = 500
+    (folder / "result.json").write_text(json.dumps(report))
+    rejected = subprocess.run(
+        [sys.executable, "-", "54", "43"], input=helper, text=True,
+        capture_output=True, check=False,
+    )
+    assert rejected.returncode == 1

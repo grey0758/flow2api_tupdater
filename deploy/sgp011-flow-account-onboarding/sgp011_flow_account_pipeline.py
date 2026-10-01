@@ -9,7 +9,6 @@ tool never reads those OpenBao fields into an argument or environment variable.
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import re
 import subprocess
@@ -269,26 +268,16 @@ def prepare_remote(profile_name: str) -> dict[str, Any]:
     return reply
 
 
-def read_basic_password(use_stdin: bool) -> str:
-    value = sys.stdin.readline().rstrip("\r\n") if use_stdin else getpass.getpass(
-        "VNC Basic Auth password: "
-    )
-    if not value or len(value) > 256 or "\n" in value or "\r" in value:
-        raise PipelineError("basic_password_invalid")
-    return value
-
-
 def send_invitation(
-    record_id: str, profile_id: int, slot: int, invite_url: str, password: str
+    record_id: str, profile_id: int, slot: int, invite_url: str
 ) -> dict[str, Any]:
     body = (
         "sgp011 Flow 新账号登录槽（四小时、单次领取）\n"
         f"slot{slot}：Profile {profile_id} / OpenBao {record_id}\n"
         f"邀请链接：{invite_url}\n"
-        "VNC Basic Auth 用户名：flowlogin\n"
-        f"VNC Basic Auth 密码：{password}\n"
+        "链接内含一次性登录 token，打开后可直接进入专属 VNC 桌面，无需输入账号密码。\n"
         "请在独立桌面完成 Google/Flow 与 Labs 可见授权；遇到 CAPTCHA、设备确认或恢复挑战请人工处理。\n"
-        "请勿安装打码扩展；系统会保留该 Profile/VNC，人工完成后继续无成本检查。"
+        "YesCaptcha 扩展已预装并自动配置；系统会保留该 Profile/VNC，人工完成后继续无成本检查。"
     )
     result = run([str(WECOM_SENDER)], input_text=body, timeout=300)
     reply = parse_last_json(result.stdout)
@@ -321,16 +310,13 @@ def command_prepare_invite(args: argparse.Namespace) -> dict[str, Any]:
         raise PipelineError("openbao_record_fields_missing")
     if data.get("STATUS") != "pending":
         raise PipelineError("record_not_pending")
-    password = read_basic_password(args.basic_password_stdin)
     invitation = prepare_remote(args.profile_name)
     delivered = send_invitation(
         record_id,
         int(invitation["profile_id"]),
         int(invitation["slot"]),
         str(invitation["invite_url"]),
-        password,
     )
-    password = ""
     version = bao.update(
         record_id,
         {
@@ -397,6 +383,56 @@ def command_onboard(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+ACCEPTANCE_EVIDENCE_HELPER = r'''
+import glob, json, sys
+from pathlib import Path
+
+profile_id, token_id = map(int, sys.argv[1:3])
+accepted = []
+for name in glob.glob("/home/grey/backups/sgp011-flow-account-health-*/result.json"):
+    path = Path(name)
+    if not (path.parent / "COMPLETE").is_file():
+        continue
+    try:
+        report = json.loads(path.read_text(encoding="ascii"))
+    except (OSError, ValueError):
+        continue
+    if report.get("success") is not True or report.get("mode") != "pending_image_acceptance":
+        continue
+    for item in report.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("profile_id") != profile_id or item.get("flow_token_id") != token_id:
+            continue
+        required = (
+            item.get("success") is True
+            and item.get("stage") == "complete"
+            and item.get("newapi_http") == 200
+            and item.get("media_http") == 200
+            and item.get("image_format") == "JPEG"
+            and isinstance(item.get("width"), int) and item["width"] > 0
+            and isinstance(item.get("height"), int) and item["height"] > 0
+            and isinstance(item.get("bytes"), int) and item["bytes"] > 0
+            and isinstance(item.get("flow_log_id"), int)
+            and isinstance(item.get("newapi_log_id"), int)
+            and item.get("newapi_log_rows") == 1
+        )
+        if required:
+            accepted.append((path.parent.name, item))
+if len(accepted) != 1:
+    print(json.dumps({"success": False, "error": "accepted_report_not_unique"}))
+    raise SystemExit(1)
+name, item = accepted[0]
+safe = {key: item[key] for key in (
+    "profile_id", "flow_token_id", "flow_log_id", "newapi_log_id",
+    "media_http", "width", "height",
+)}
+safe["success"] = True
+print(json.dumps({"success": True, "mode": "pending_image_acceptance",
+                  "evidence": name, "results": [safe]}, separators=(",", ":")))
+'''
+
+
 def command_accept(args: argparse.Namespace) -> dict[str, Any]:
     record_id = validate_record_id(args.record_id)
     bao = OpenBao()
@@ -408,6 +444,12 @@ def command_accept(args: argparse.Namespace) -> dict[str, Any]:
         profile_id=args.profile_id,
         token_id=args.token_id,
     )
+    # Record the paid-attempt boundary before invoking the host wrapper.  A
+    # caller crash or output parsing error must never submit a second image.
+    bao.update(
+        record_id,
+        {"STATUS": "image_acceptance_running", "IMAGE_ACCEPTANCE_STARTED_AT": utc_now()},
+    )
     result = run(
         [
             "ssh-1p", "sgp011", "sudo",
@@ -416,8 +458,19 @@ def command_accept(args: argparse.Namespace) -> dict[str, Any]:
         ],
         timeout=1200,
     )
-    reply = parse_last_json(result.stdout)
-    if result.returncode or reply.get("success") is not True:
+    # The maintenance wrapper writes the complete report to a root-only file;
+    # its stdout is an inner summary and is not the acceptance contract.
+    evidence = run(
+        ["ssh-1p", "sgp011", "sudo", "python3", "-", str(args.profile_id), str(args.token_id)],
+        input_text=ACCEPTANCE_EVIDENCE_HELPER,
+        timeout=120,
+    )
+    try:
+        reply = parse_last_json(evidence.stdout)
+    except PipelineError:
+        reply = {}
+    if result.returncode or evidence.returncode or reply.get("success") is not True:
+        bao.update(record_id, {"STATUS": "image_acceptance_review"})
         raise PipelineError("image_acceptance_failed_no_retry")
     results = reply.get("results") or []
     matches = [
@@ -428,11 +481,16 @@ def command_accept(args: argparse.Namespace) -> dict[str, Any]:
         and item.get("success") is True
     ]
     if reply.get("mode") != "pending_image_acceptance" or len(matches) != 1:
+        bao.update(record_id, {"STATUS": "image_acceptance_review"})
         raise PipelineError("image_acceptance_contract_failed")
     item = matches[0]
     version = bao.update(
         record_id,
-        {"STATUS": "image_accepted", "IMAGE_ACCEPTED_AT": utc_now()},
+        {
+            "STATUS": "image_accepted",
+            "IMAGE_ACCEPTED_AT": utc_now(),
+            "IMAGE_ACCEPTANCE_EVIDENCE": str(reply["evidence"]),
+        },
     )
     return {
         "success": True,
@@ -597,10 +655,6 @@ def parser() -> argparse.ArgumentParser:
     )
     prepare.add_argument("--record-id", required=True)
     prepare.add_argument("--profile-name", required=True)
-    prepare.add_argument(
-        "--basic-password-stdin", action="store_true",
-        help="read the established VNC Basic Auth password from stdin",
-    )
     prepare.set_defaults(handler=command_prepare_invite)
 
     onboard = commands.add_parser(
