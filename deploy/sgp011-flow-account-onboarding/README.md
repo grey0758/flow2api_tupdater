@@ -84,13 +84,19 @@ left for operator reconciliation. `image_acceptance_review` must be checked
 against the original root-only report before any further request. Automatic
 challenge handling never bypasses Google's manual checks.
 
-The default deployment exposes two core slots. The optional
+The 2026-10-01 production deployment exposes five core slots. The
 `docker-compose.login-slots-five.yml` overlay adds three isolated core slots,
 each with its own browser volume, control/egress socket, UID, extension mount,
 and resource limits. The extra core slots use `core3`–`core5` host paths so
 the retained private slot3 sidecar is not touched. Stage those extension
 bundles and verify the host's capacity before enabling the overlay. The
-five-slot overlay is source code until separately deployed and verified.
+five-slot overlay is deployed with the production image override in this
+directory. Always pass `-p sgp011-flow2api-token-updater-v34` to Compose so
+the control plane and workers use the same named browser volumes. The current
+readback has core1/2 quarantined and core3/4/5 free, so `batch --parallel 5`
+currently starts at most three visible login attempts. The operator's
+read-only `status` and slot-capacity checks succeeded after cutover; a full
+new-account batch has not yet been run on this release.
 An unfinished Profile claim quarantines only its own numbered core slot;
 claims with no trustworthy slot binding still stop all new invitations.
 

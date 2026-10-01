@@ -155,7 +155,7 @@ or enable a new Flow token from a login report alone.
 
 ## Optional five-slot automated batch
 
-The default control deployment still advertises two core slots. The optional
+The production control deployment now advertises five core slots. The
 `docker-compose.login-slots-five.yml` overlay adds three core slots and sets
 `LOGIN_SLOT_COUNT=5`. Logical slots 3–5 use independent `core3`–`core5` host
 control and egress directories, separate browser volumes, distinct UIDs, and
@@ -178,6 +178,24 @@ gate remains mandatory. Guarded receiver sync, paid acceptance, and
 enablement are serialized. Uncertain side effects are recorded as review
 states and require reconciliation of original evidence before any retry.
 
-This overlay and automation have source-level tests; they have not been
-deployed or qualified against live accounts by this source update. The
-retained private Profile53 SMS session must remain available during rollout.
+On 2026-10-01 UTC, commit `1d25058` completed the five-slot worker fixes and
+production overlays. The deployed control image is
+`flow2api-token-updater-control:auto-five-20261001` (image ID
+`sha256:34b08ff036f7b80dc636a18fb94b6869cc2e07e821640c2cc7e00d395305f66e`).
+The new core3–5 worker images are tagged `auto-five-r2-20261001`; core1/2
+retain their distinct existing images. Use Compose project
+`sgp011-flow2api-token-updater-v34` explicitly when operating this stack;
+the default Compose project name would create a separate set of empty volumes.
+Backup: `sgp011:/home/grey/backups/sgp011-auto-five-20261001T1955Z`.
+
+Post-cutover readback showed core1/2 quarantined by retained Profiles18/19 and
+core3/4/5 free. All three new workers and egress relays were healthy with zero
+restarts; each worker's HTTPS CONNECT through its relay returned 200. The
+private sidecars remained healthy. Both SQLite integrity checks were `ok`,
+Flow tasks were zero, the public invitation page returned 200, and session,
+VNC asset, admin API and account-import requests without authorization returned
+401. The batch operator's capacity check returned `free=3,total=5` and its
+read-only OpenBao status command succeeded. No fresh account was imported as
+part of this deployment, so the complete automated login-to-image path awaits
+the next owner-selected new account. Preserve Profile53's separate SMS VNC
+and do not select old pending or previously restricted records as a canary.
