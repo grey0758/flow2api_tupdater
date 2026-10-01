@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Operate the non-provider-secret sgp011 Flow account onboarding pipeline.
+"""Operate the guarded sgp011 Flow account onboarding pipeline.
 
-Google identity selection, password, MFA/TOTP, CAPTCHA, device/recovery
-challenges and consent remain visible owner actions in the isolated VNC. This
-tool never reads those OpenBao fields into an argument or environment variable.
+Passwords and TOTP seeds move from OpenBao to the assigned browser worker in
+memory over stdin and authenticated local sockets. Unknown Google challenges
+remain visible in that worker for the owner.
 """
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -154,6 +156,20 @@ class OpenBao:
             raise PipelineError("openbao_update_invalid")
         return next_version
 
+    def transition(self, record_id: str, expected: str, fields: dict[str, str]) -> int:
+        data, version = self.get(record_id)
+        if data.get("STATUS") != expected:
+            raise PipelineError("record_stage_mismatch")
+        data.update(fields)
+        reply = self._request(
+            "POST", f"{BAO_ROOT}/{record_id}",
+            {"options": {"cas": version}, "data": data}, token=self.token,
+        )
+        next_version = (reply.get("data") or {}).get("version")
+        if not isinstance(next_version, int):
+            raise PipelineError("openbao_update_invalid")
+        return next_version
+
 
 def safe_record(record_id: str, data: dict[str, Any], version: int) -> dict[str, Any]:
     return {
@@ -268,6 +284,24 @@ def prepare_remote(profile_name: str) -> dict[str, Any]:
     return reply
 
 
+def auto_login_remote(profile_id: int, data: dict[str, Any]) -> dict[str, Any]:
+    secret = {"email": data["EMAIL"], "password": data["PASSWORD"],
+              "totp_seed": data["TOTP_SECRET"]}
+    result = run(
+        ["ssh-1p", "sgp011", "sudo", "docker", "exec", "-i",
+         "sgp011-flow2api-token-updater-v34", "python", "-m",
+         "token_updater.account_auto_login_remote", str(profile_id)],
+        input_text=json.dumps(secret, separators=(",", ":")), timeout=900,
+    )
+    secret.clear()
+    if result.returncode:
+        raise PipelineError("auto_login_transport_review")
+    reply = parse_last_json(result.stdout)
+    if reply.get("profile_id") != profile_id:
+        raise PipelineError("auto_login_scope_invalid")
+    return reply
+
+
 def send_invitation(
     record_id: str, profile_id: int, slot: int, invite_url: str
 ) -> dict[str, Any]:
@@ -310,6 +344,7 @@ def command_prepare_invite(args: argparse.Namespace) -> dict[str, Any]:
         raise PipelineError("openbao_record_fields_missing")
     if data.get("STATUS") != "pending":
         raise PipelineError("record_not_pending")
+    bao.transition(record_id, "pending", {"STATUS": "preparing"})
     invitation = prepare_remote(args.profile_name)
     delivered = send_invitation(
         record_id,
@@ -317,8 +352,8 @@ def command_prepare_invite(args: argparse.Namespace) -> dict[str, Any]:
         int(invitation["slot"]),
         str(invitation["invite_url"]),
     )
-    version = bao.update(
-        record_id,
+    version = bao.transition(
+        record_id, "preparing",
         {
             "STATUS": "login_invited",
             "PROFILE_ID": str(invitation["profile_id"]),
@@ -340,12 +375,16 @@ def command_onboard(args: argparse.Namespace) -> dict[str, Any]:
     record_id = validate_record_id(args.record_id)
     bao = OpenBao()
     data, _ = bao.get(record_id)
+    prior_status = str(data.get("STATUS") or "")
+    if prior_status not in {"login_invited", "ready_to_onboard"}:
+        raise PipelineError("record_stage_mismatch")
     expected_identity = require_record_binding(
         record_id,
         data,
-        status="login_invited",
+        status=prior_status,
         profile_id=args.profile_id,
     )
+    bao.transition(record_id, prior_status, {"STATUS": "onboarding_running"})
     result = run(
         [
             "ssh-1p", "sgp011", "sudo",
@@ -356,15 +395,20 @@ def command_onboard(args: argparse.Namespace) -> dict[str, Any]:
         timeout=900,
     )
     expected_identity = ""
-    reply = parse_last_json(result.stdout)
+    try:
+        reply = parse_last_json(result.stdout)
+    except PipelineError:
+        reply = {}
     if result.returncode or reply.get("success") is not True:
+        bao.transition(record_id, "onboarding_running", {"STATUS": "onboarding_review"})
         raise PipelineError(str(reply.get("error_code") or "onboard_failed_no_retry"))
     if reply.get("pending_image_acceptance") is not True or not isinstance(
         reply.get("token_id"), int
     ):
+        bao.transition(record_id, "onboarding_running", {"STATUS": "onboarding_review"})
         raise PipelineError("onboard_pending_contract_failed")
-    version = bao.update(
-        record_id,
+    version = bao.transition(
+        record_id, "onboarding_running",
         {
             "STATUS": "pending_image_acceptance",
             "PROFILE_ID": str(args.profile_id),
@@ -446,8 +490,8 @@ def command_accept(args: argparse.Namespace) -> dict[str, Any]:
     )
     # Record the paid-attempt boundary before invoking the host wrapper.  A
     # caller crash or output parsing error must never submit a second image.
-    bao.update(
-        record_id,
+    bao.transition(
+        record_id, "pending_image_acceptance",
         {"STATUS": "image_acceptance_running", "IMAGE_ACCEPTANCE_STARTED_AT": utc_now()},
     )
     result = run(
@@ -470,7 +514,7 @@ def command_accept(args: argparse.Namespace) -> dict[str, Any]:
     except PipelineError:
         reply = {}
     if result.returncode or evidence.returncode or reply.get("success") is not True:
-        bao.update(record_id, {"STATUS": "image_acceptance_review"})
+        bao.transition(record_id, "image_acceptance_running", {"STATUS": "image_acceptance_review"})
         raise PipelineError("image_acceptance_failed_no_retry")
     results = reply.get("results") or []
     matches = [
@@ -481,11 +525,11 @@ def command_accept(args: argparse.Namespace) -> dict[str, Any]:
         and item.get("success") is True
     ]
     if reply.get("mode") != "pending_image_acceptance" or len(matches) != 1:
-        bao.update(record_id, {"STATUS": "image_acceptance_review"})
+        bao.transition(record_id, "image_acceptance_running", {"STATUS": "image_acceptance_review"})
         raise PipelineError("image_acceptance_contract_failed")
     item = matches[0]
-    version = bao.update(
-        record_id,
+    version = bao.transition(
+        record_id, "image_acceptance_running",
         {
             "STATUS": "image_accepted",
             "IMAGE_ACCEPTED_AT": utc_now(),
@@ -617,16 +661,21 @@ def command_enable(args: argparse.Namespace) -> dict[str, Any]:
         profile_id=args.profile_id,
         token_id=args.token_id,
     )
+    bao.transition(record_id, "image_accepted", {"STATUS": "enable_running"})
     result = run(
         ["ssh-1p", "sgp011", "sudo", "python3", "-", str(args.profile_id), str(args.token_id)],
         input_text=ENABLE_HELPER,
         timeout=300,
     )
-    reply = parse_last_json(result.stdout)
+    try:
+        reply = parse_last_json(result.stdout)
+    except PipelineError:
+        reply = {}
     if result.returncode or reply.get("success") is not True:
+        bao.transition(record_id, "enable_running", {"STATUS": "enable_review"})
         raise PipelineError("explicit_enable_failed")
-    version = bao.update(
-        record_id,
+    version = bao.transition(
+        record_id, "enable_running",
         {"STATUS": "imported", "ENABLED_AT": utc_now()},
     )
     return {
@@ -639,11 +688,115 @@ def command_enable(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+SLOT_CAPACITY_HELPER = r'''
+import json, os, urllib.request
+base = "http://127.0.0.1:8002"
+def call(method, path, body=None, token=""):
+    headers = {"Content-Type": "application/json"}
+    if token: headers["X-Flow-Updater-Authorization"] = "Bearer " + token
+    payload = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(base + path, data=payload, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=30) as response: return json.load(response)
+session = call("POST", "/api/login", {"password": os.environ["ADMIN_PASSWORD"]})["token"]
+try:
+    slots = call("GET", "/api/login-slots", token=session)["slots"]
+    print(json.dumps({"free": sum(item.get("state") == "free" for item in slots),
+                      "total": len(slots)}))
+finally:
+    try: call("POST", "/api/logout", token=session)
+    except Exception: pass
+'''
+
+
+def slot_capacity_remote() -> dict[str, int]:
+    result = run(["ssh-1p", "sgp011", "sudo", "docker", "exec", "-i",
+                  "sgp011-flow2api-token-updater-v34", "python", "-"],
+                 input_text=SLOT_CAPACITY_HELPER, timeout=90)
+    if result.returncode:
+        raise PipelineError("slot_capacity_unavailable")
+    reply = parse_last_json(result.stdout)
+    if not all(isinstance(reply.get(key), int) for key in ("free", "total")):
+        raise PipelineError("slot_capacity_invalid")
+    return reply
+
+
+def _batch_record(record_id: str, admission_lock: threading.Lock) -> dict[str, Any]:
+    profile_id = None
+    try:
+        bao = OpenBao()
+        data, _ = bao.get(record_id)
+        if data.get("RECORD_ID") != record_id or data.get("STATUS") != "pending":
+            raise PipelineError("record_not_fresh_pending")
+        if not all(isinstance(data.get(key), str) and data[key] for key in
+                   ("EMAIL", "PASSWORD", "TOTP_SECRET")):
+            raise PipelineError("openbao_record_fields_missing")
+        bao.transition(record_id, "pending", {"STATUS": "preparing"})
+        invitation = prepare_remote(f"flow-auto-{record_id}")
+        profile_id = int(invitation["profile_id"])
+        bao.transition(record_id, "preparing", {
+            "STATUS": "login_invited", "PROFILE_ID": str(profile_id),
+            "LOGIN_SLOT": str(invitation["slot"]), "INVITED_AT": utc_now(),
+        })
+        result = auto_login_remote(profile_id, data)
+        data.clear()
+        if result.get("success") is not True:
+            code = str(result.get("error_code") or "login_review")[:64]
+            bao.transition(record_id, "login_invited", {"LOGIN_ERROR_CODE": code})
+            delivered = send_invitation(record_id, profile_id, int(invitation["slot"]),
+                                        str(invitation["invite_url"]))
+            return {"record_id": record_id, "profile_id": profile_id,
+                    "status": "manual_review", "error_code": code,
+                    "invitation_delivered": delivered["provider_accepted"]}
+        bao.transition(record_id, "login_invited", {
+            "STATUS": "ready_to_onboard", "LOGIN_VALIDATED_AT": utc_now(),
+        })
+        # Receiver sync, paid image, and activation mutate shared state. Keep
+        # these stages serial even while up to five browser logins run.
+        with admission_lock:
+            onboard = command_onboard(argparse.Namespace(
+                record_id=record_id, profile_id=profile_id,
+            ))
+            token_id = int(onboard["flow_token_id"])
+            command_accept(argparse.Namespace(
+                record_id=record_id, profile_id=profile_id, token_id=token_id,
+            ))
+            command_enable(argparse.Namespace(
+                record_id=record_id, profile_id=profile_id, token_id=token_id,
+            ))
+        return {"record_id": record_id, "profile_id": profile_id,
+                "flow_token_id": token_id, "status": "imported"}
+    except PipelineError as exc:
+        return {"record_id": record_id, "profile_id": profile_id,
+                "status": "review", "error_code": exc.code}
+    except Exception:
+        return {"record_id": record_id, "profile_id": profile_id,
+                "status": "review", "error_code": "unexpected_failure"}
+
+
+def command_batch(args: argparse.Namespace) -> dict[str, Any]:
+    record_ids = [validate_record_id(item) for item in args.record_ids]
+    if len(record_ids) != len(set(record_ids)) or not 1 <= args.parallel <= 5:
+        raise PipelineError("batch_arguments_invalid")
+    capacity = slot_capacity_remote()
+    parallel = min(args.parallel, capacity["free"], 5)
+    if parallel < 1:
+        raise PipelineError("no_free_login_slots")
+    admission_lock = threading.Lock()
+    with ThreadPoolExecutor(max_workers=parallel) as pool:
+        futures = {pool.submit(_batch_record, item, admission_lock): item
+                   for item in record_ids}
+        results = [future.result() for future in as_completed(futures)]
+    results.sort(key=lambda item: item["record_id"])
+    return {"success": all(item["status"] == "imported" for item in results),
+            "requested_parallel": args.parallel, "active_parallel": parallel,
+            "results": results}
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         description=(
-            "Operate sgp011 Flow onboarding around the visible owner-login boundary; "
-            "never automate Google credentials or MFA"
+            "Automate guarded sgp011 Flow onboarding through isolated visible slots; "
+            "stop for unknown Google challenges"
         )
     )
     commands = root.add_subparsers(dest="command", required=True)
@@ -679,6 +832,13 @@ def parser() -> argparse.ArgumentParser:
     enable.add_argument("--profile-id", required=True, type=int)
     enable.add_argument("--token-id", required=True, type=int)
     enable.set_defaults(handler=command_enable)
+
+    batch = commands.add_parser(
+        "batch", help="automate distinct fresh accounts with at most five visible slots"
+    )
+    batch.add_argument("--parallel", type=int, default=5)
+    batch.add_argument("record_ids", nargs="+")
+    batch.set_defaults(handler=command_batch)
     return root
 
 
@@ -693,7 +853,7 @@ def main() -> int:
         print(json.dumps({"success": False, "error": "unexpected_failure"}, sort_keys=True))
         return 1
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-    return 0
+    return 0 if result.get("success") is True else 1
 
 
 if __name__ == "__main__":

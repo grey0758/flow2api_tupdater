@@ -1,4 +1,4 @@
-"""Coordinate two isolated, non-root owner-login worker containers."""
+"""Coordinate up to five isolated, non-root owner-login worker containers."""
 
 import asyncio
 import hashlib
@@ -19,7 +19,7 @@ from .logger import logger
 from .login_worker_protocol import sign_headers
 
 
-MAX_LOGIN_SLOTS = 2
+MAX_LOGIN_SLOTS = 5
 INVITE_TTL_SECONDS = 4 * 60 * 60
 
 
@@ -59,6 +59,15 @@ class LoginSlots:
         self._quarantined_numbers: set[int] = set()
         self._reconciled = False
 
+    @staticmethod
+    def numbers() -> range:
+        configured = len(config.login_slot_worker_ids)
+        if not (2 <= configured <= MAX_LOGIN_SLOTS
+                and len(config.login_slot_worker_sockets) == configured
+                and len(config.login_slot_worker_proxy_urls) == configured):
+            raise RuntimeError("login slot configuration is inconsistent")
+        return range(1, configured + 1)
+
     async def reconcile(self) -> None:
         """Revoke lost invitations and stop unfinished worker contexts.
 
@@ -78,7 +87,7 @@ class LoginSlots:
         for profile in unfinished:
             number = int(profile.get("login_slot_number") or 0)
             generation = str(profile.get("login_slot_generation") or "")
-            if number not in {1, 2} or not generation or len(generation) > 128:
+            if number not in self.numbers() or not generation or len(generation) > 128:
                 continue
             if number in claimed_by_number:
                 raise RuntimeError(f"multiple unfinished Profiles claim login slot {number}")
@@ -140,7 +149,7 @@ class LoginSlots:
         return [
             self._slots[number].public() if number in self._slots
             else {"slot": number, "state": "quarantined" if orphaned or number in self._quarantined_numbers else "free"}
-            for number in range(1, MAX_LOGIN_SLOTS + 1)
+            for number in self.numbers()
         ]
 
     def authorize(self, capability: str) -> LoginSlot:
@@ -361,11 +370,11 @@ class LoginSlots:
                 if browser_manager.get_active_profile_id() is not None:
                     raise LoginSlotError(409, "旧版登录桌面仍在运行；请先完成其安全交接")
                 number = next((
-                    i for i in range(1, MAX_LOGIN_SLOTS + 1)
+                    i for i in self.numbers()
                     if i not in self._slots and i not in self._quarantined_numbers
                 ), None)
                 if number is None:
-                    raise LoginSlotError(409, "两个登录槽位已满")
+                    raise LoginSlotError(409, "登录槽位已满")
                 stage, target = self._slot_paths(number, profile_id)
                 if target.exists() and (not target.is_dir() or any(target.iterdir())):
                     raise LoginSlotError(409, "正式 Profile 目录已有数据；不可交给新邀请")
@@ -418,7 +427,7 @@ class LoginSlots:
         Never reconstruct an old capability/generation or reset the claimed
         database row.  A different slot or a live browser is a hard stop.
         """
-        if not self._reconciled or number not in {1, 2}:
+        if not self._reconciled or number not in self.numbers():
             raise LoginSlotError(503, "登录槽位尚未完成安全对账")
         profile_id = int(profile["id"])
         if not (
@@ -634,6 +643,42 @@ class LoginSlots:
                     "is_logged_in": True,
                     "has_flow_project": True,
                     "profile_name": "",
+                }
+
+    async def auto_login(self, expected: LoginSlot, email: str,
+                         password: str, totp_seed: str) -> dict:
+        slot = expected
+        async with slot.lifecycle:
+            async with slot.input_gate:
+                async with self._lock:
+                    if self._slots.get(slot.number) is not slot or slot.state != "ready":
+                        raise LoginSlotError(409, "登录槽位当前不能自动登录")
+                    slot.state = "checking"
+                try:
+                    result = await self._worker(
+                        slot, "auto-login",
+                        payload={"email": email, "password": password,
+                                 "totp_seed": totp_seed}, timeout=360,
+                    )
+                except Exception as exc:
+                    async with self._lock:
+                        if self._slots.get(slot.number) is slot:
+                            slot.state = "quarantined"
+                            slot.closed.set()
+                    raise LoginSlotError(503, "登录自动化失联；保留槽位供检查") from exc
+                finally:
+                    password = ""
+                    totp_seed = ""
+                async with self._lock:
+                    if self._slots.get(slot.number) is slot:
+                        slot.state = "ready"
+                return {
+                    "success": result.get("success") is True,
+                    "stage": result.get("stage") if result.get("success") is True else None,
+                    "error_code": result.get("error_code") if result.get("success") is not True else None,
+                    "requires_manual_action": result.get("requires_manual_action") is True,
+                    "slot": slot.number,
+                    "profile_id": slot.profile_id,
                 }
 
     async def stop(self) -> None:

@@ -17,6 +17,7 @@ from .database import profile_db
 from .proxy_utils import parse_proxy, format_proxy_for_playwright
 from .logger import logger
 from .browser_profile import configure_web_only_profile
+from .browser_extensions import configure_yescaptcha, visible_browser_extension_options
 from .session_validation import (
     LABS_SESSION_URL, LABS_CSRF_URL, LABS_SIGNIN_URL, CREDITS_URL,
     cookie_is_live, failure, scoped_google_cookies, validate_google_cookies,
@@ -443,6 +444,7 @@ class BrowserManager:
 
     async def _launch_persistent_context(self, **kwargs):
         user_data_dir = kwargs["user_data_dir"]
+        visible_login = kwargs.get("headless") is False
         configure_web_only_profile(user_data_dir)
         selected = self._selected_chromium_profile(user_data_dir)
         args = list(kwargs.get("args") or [])
@@ -459,8 +461,25 @@ class BrowserManager:
                 args = list(LOGIN_BROWSER_ARGS)
             args.append(f"--profile-directory={selected}")
             kwargs["args"] = args
+        if visible_login:
+            kwargs["proxy"] = {"server": os.getenv("VNC_PROXY_SERVER", "http://172.19.240.1:18088")}
+            args, ignored_defaults = visible_browser_extension_options(
+                list(kwargs.get("args") or []),
+                list(kwargs.get("ignore_default_args") or []),
+                Path(os.getenv("VNC_EXTENSION_DIR", "/vnc-extension")),
+                required=os.getenv("VNC_EXTENSION_REQUIRED") == "1",
+            )
+            kwargs["args"] = args
+            if ignored_defaults:
+                kwargs["ignore_default_args"] = ignored_defaults
         try:
             context = await self._playwright.chromium.launch_persistent_context(**kwargs)
+            if visible_login:
+                try:
+                    await configure_yescaptcha(context)
+                except Exception:
+                    await context.close()
+                    raise
         except Exception:
             if owns_background_xvfb:
                 await self._stop_background_xvfb()

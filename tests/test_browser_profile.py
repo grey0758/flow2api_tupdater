@@ -84,8 +84,41 @@ class BrowserLaunchTests(unittest.IsolatedAsyncioTestCase):
             manager=BrowserManager()
             manager._playwright=SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=AsyncMock(side_effect=launch)))
             options={"user_data_dir":root,"headless":False,"proxy":{"server":"socks5://127.0.0.1:20001"},"args":["--example"]}
-            self.assertEqual(await manager._launch_persistent_context(**options), "context")
-            manager._playwright.chromium.launch_persistent_context.assert_awaited_once_with(**options)
+            with patch("token_updater.browser.configure_yescaptcha", new_callable=AsyncMock) as extension_check:
+                self.assertEqual(await manager._launch_persistent_context(**options), "context")
+                extension_check.assert_awaited_once_with("context")
+            expected = dict(options)
+            expected["proxy"] = {"server": "http://172.19.240.1:18088"}
+            manager._playwright.chromium.launch_persistent_context.assert_awaited_once_with(**expected)
+
+    async def test_visible_vnc_profile_loads_extension_and_headless_keeps_existing_flags(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            extension = base / "extension"
+            extension.mkdir()
+            (extension / "manifest.json").write_text(json.dumps({
+                "manifest_version": 3, "name": "YesCaptcha", "version": "1.4.7",
+            }))
+            manager = BrowserManager()
+            launch = AsyncMock(return_value="context")
+            manager._playwright = SimpleNamespace(
+                chromium=SimpleNamespace(launch_persistent_context=launch)
+            )
+            with patch.dict("os.environ", {"VNC_EXTENSION_DIR": str(extension), "VNC_EXTENSION_REQUIRED": "1"}), patch("token_updater.browser.configure_yescaptcha", new_callable=AsyncMock) as extension_check:
+                self.assertEqual(await manager._launch_persistent_context(
+                    user_data_dir=str(base / "visible"), headless=False,
+                    args=list(LOGIN_BROWSER_ARGS), ignore_default_args=["--enable-automation"],
+                ), "context")
+                visible = launch.await_args.kwargs
+                self.assertIn(f"--load-extension={extension}", visible["args"])
+                self.assertNotIn("--disable-extensions", visible["args"])
+                self.assertIn("--disable-extensions", visible["ignore_default_args"])
+                extension_check.assert_awaited_once_with("context")
+                await manager._launch_persistent_context(
+                    user_data_dir=str(base / "background"), headless=True,
+                    args=["--disable-extensions"],
+                )
+                self.assertEqual(launch.await_args.kwargs["args"], ["--disable-extensions"])
 
     def test_mutable_last_used_child_profile_fails_closed_without_binding(self):
         with tempfile.TemporaryDirectory() as root:

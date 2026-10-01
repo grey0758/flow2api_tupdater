@@ -2,6 +2,9 @@ import importlib.util
 import json
 import subprocess
 import sys
+import threading
+import time
+from argparse import Namespace
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -105,6 +108,56 @@ def test_embedded_remote_helpers_are_valid_python():
     compile(MODULE.PREPARE_HELPER, "<prepare-helper>", "exec")
     compile(MODULE.ENABLE_HELPER, "<enable-helper>", "exec")
     compile(MODULE.ACCEPTANCE_EVIDENCE_HELPER, "<acceptance-evidence-helper>", "exec")
+    compile(MODULE.SLOT_CAPACITY_HELPER, "<capacity-helper>", "exec")
+
+
+def test_auto_login_secret_uses_stdin_only(monkeypatch):
+    captured = {}
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["stdin"] = kwargs["input_text"]
+        return subprocess.CompletedProcess(command, 0, '{"success":true,"profile_id":61}', "")
+    monkeypatch.setattr(MODULE, "run", fake_run)
+    reply = MODULE.auto_login_remote(61, {
+        "EMAIL": "owner@example.invalid", "PASSWORD": "private-password",
+        "TOTP_SECRET": "PRIVATESEED",
+    })
+    assert reply["success"] is True
+    assert "private-password" not in " ".join(captured["command"])
+    assert "PRIVATESEED" not in " ".join(captured["command"])
+    assert json.loads(captured["stdin"])["password"] == "private-password"
+
+
+def test_batch_caps_active_profiles_at_five(monkeypatch):
+    counts = {"active": 0, "peak": 0}
+    guard = threading.Lock()
+    def fake_record(record_id, admission_lock):
+        with guard:
+            counts["active"] += 1
+            counts["peak"] = max(counts["peak"], counts["active"])
+        time.sleep(0.02)
+        with guard:
+            counts["active"] -= 1
+        return {"record_id": record_id, "status": "imported"}
+    monkeypatch.setattr(MODULE, "slot_capacity_remote", lambda: {"free": 5, "total": 5})
+    monkeypatch.setattr(MODULE, "_batch_record", fake_record)
+    report = MODULE.command_batch(Namespace(
+        parallel=5, record_ids=[f"account-{number:03d}" for number in range(50, 57)],
+    ))
+    assert report["success"] is True
+    assert report["active_parallel"] == 5
+    assert counts["peak"] == 5
+
+
+def test_stage_transition_refuses_a_changed_record_before_side_effect(monkeypatch):
+    bao = object.__new__(MODULE.OpenBao)
+    bao.token = "test-token"
+    monkeypatch.setattr(bao, "get", lambda _: ({"STATUS": "image_acceptance_running"}, 4))
+    called = []
+    monkeypatch.setattr(bao, "_request", lambda *args, **kwargs: called.append(args))
+    with pytest.raises(MODULE.PipelineError, match="record_stage_mismatch"):
+        bao.transition("account-001", "pending_image_acceptance", {"STATUS": "image_acceptance_running"})
+    assert called == []
 
 
 def test_completed_image_report_is_reconciled_without_a_second_request(tmp_path):

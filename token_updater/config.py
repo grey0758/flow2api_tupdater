@@ -65,10 +65,10 @@ class Config(BaseModel):
     session_ttl_minutes: int
     config_file: str
     login_slot_root: str
-    login_slot_worker_sockets: tuple[str, str]
-    login_slot_worker_proxy_urls: tuple[str, str]
+    login_slot_worker_sockets: tuple[str, ...]
+    login_slot_worker_proxy_urls: tuple[str, ...]
     login_slot_expected_source_proxy: str
-    login_slot_worker_ids: tuple[int, int]
+    login_slot_worker_ids: tuple[int, ...]
     login_slot_signing_private_key: str
 
     def save(self) -> None:
@@ -84,6 +84,9 @@ def _build_config() -> Config:
     connection_token = _get_env("CONNECTION_TOKEN") or persisted.get("connection_token", "")
     refresh_interval = _parse_int(_get_env("REFRESH_INTERVAL") or str(persisted.get("refresh_interval", 60)), 60)
     enable_vnc = _parse_bool(_get_env("ENABLE_VNC"), default=True)
+    login_slot_count = _parse_int(_get_env("LOGIN_SLOT_COUNT"), 2)
+    if not 2 <= login_slot_count <= 5:
+        raise ValueError("LOGIN_SLOT_COUNT must be between 2 and 5")
 
     return Config(
         admin_password=_get_env("ADMIN_PASSWORD") or "",
@@ -100,20 +103,21 @@ def _build_config() -> Config:
         session_ttl_minutes=_parse_int(_get_env("SESSION_TTL_MINUTES"), 1440),
         config_file=config_file,
         login_slot_root=_get_env("LOGIN_SLOT_ROOT") or "/app/profiles/.login-slots",
-        login_slot_worker_sockets=(
-            _get_env("LOGIN_SLOT1_WORKER_SOCKET") or "/run/login-slot1/worker.sock",
-            _get_env("LOGIN_SLOT2_WORKER_SOCKET") or "/run/login-slot2/worker.sock",
+        login_slot_worker_sockets=tuple(
+            _get_env(f"LOGIN_SLOT{number}_WORKER_SOCKET") or
+            f"/run/login-slot{number}/worker.sock"
+            for number in range(1, login_slot_count + 1)
         ),
-        login_slot_worker_proxy_urls=(
-            _get_env("LOGIN_SLOT1_PROXY_URL") or "http://127.0.0.1:18088",
-            _get_env("LOGIN_SLOT2_PROXY_URL") or "http://127.0.0.1:18088",
+        login_slot_worker_proxy_urls=tuple(
+            _get_env(f"LOGIN_SLOT{number}_PROXY_URL") or "http://127.0.0.1:18088"
+            for number in range(1, login_slot_count + 1)
         ),
         login_slot_expected_source_proxy=(
             _get_env("LOGIN_SLOT_EXPECTED_SOURCE_PROXY") or "http://172.19.240.1:18088"
         ),
-        login_slot_worker_ids=(
-            _parse_int(_get_env("LOGIN_SLOT1_UID"), 11001),
-            _parse_int(_get_env("LOGIN_SLOT2_UID"), 11002),
+        login_slot_worker_ids=tuple(
+            _parse_int(_get_env(f"LOGIN_SLOT{number}_UID"), 11000 + number)
+            for number in range(1, login_slot_count + 1)
         ),
         login_slot_signing_private_key=_get_env("LOGIN_SLOT_SIGNING_PRIVATE_KEY") or "",
     )

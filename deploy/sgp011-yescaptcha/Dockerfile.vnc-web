@@ -1,0 +1,10 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG RUNTIME_USER
+ARG PATCH_MAIN=0
+USER root
+COPY token_updater/browser_extensions.py /app/token_updater/browser_extensions.py
+COPY deploy/sgp011-yescaptcha/patch_live_vnc_proxy.py /tmp/patch_live_vnc_proxy.py
+RUN if [ "$PATCH_MAIN" = "1" ]; then python /tmp/patch_live_vnc_proxy.py /app/token_updater/browser.py; fi \
+    && chmod 0644 /app/token_updater/browser_extensions.py
+USER ${RUNTIME_USER}

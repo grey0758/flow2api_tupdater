@@ -24,9 +24,10 @@ RUN (getent group 12000 >/dev/null || groupadd --gid 12000 login-slots) \
 
 COPY token_updater/ /app/token_updater/
 
-RUN mkdir -p /slot/profile /control /egress \
+RUN mkdir -p /slot/profile /slot-extension /control /egress \
     && chown ${WORKER_UID}:12000 /slot/profile \
     && chmod 0700 /slot/profile \
+    && chmod 0555 /slot-extension \
     && chown ${WORKER_UID}:12000 /control /egress \
     && chmod 0770 /control /egress
 

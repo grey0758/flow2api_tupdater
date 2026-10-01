@@ -197,7 +197,7 @@ class ProfileDB:
         solely so a restarted control process can sign one scoped ``abort``
         for the old browser context before issuing a new invitation.
         """
-        if slot_number not in {1, 2} or not generation or len(generation) > 128:
+        if slot_number not in range(1, len(config.login_slot_worker_ids) + 1) or not generation or len(generation) > 128:
             return False
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
@@ -258,7 +258,7 @@ class ProfileDB:
     ) -> bool:
         """Atomically rotate only an unfinished slot's worker generation."""
         if (
-            slot_number not in {1, 2}
+            slot_number not in range(1, len(config.login_slot_worker_ids) + 1)
             or not previous_generation
             or not next_generation
             or len(previous_generation) > 128

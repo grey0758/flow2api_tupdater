@@ -1,0 +1,22 @@
+services:
+  token-updater:
+    image: flow2api-token-updater-control:yescaptcha-1.4.7
+    environment:
+      VNC_EXTENSION_REQUIRED: "1"
+    volumes:
+      - /opt/flow2api-token-updater-v34/extensions/main:/vnc-extension:ro
+      - /opt/flow2api-token-updater-v34/secrets/yescaptcha-client-key:/run/yescaptcha/client_key:ro
+  login-worker-1:
+    image: flow2api-token-updater-login-worker:slot1-yescaptcha-1.4.7
+    environment:
+      LOGIN_EXTENSION_REQUIRED: "1"
+    volumes:
+      - /opt/flow2api-token-updater-v34/extensions/slot1:/slot-extension:ro
+      - /opt/flow2api-token-updater-v34/secrets/yescaptcha-client-key:/run/yescaptcha/client_key:ro
+  login-worker-2:
+    image: flow2api-token-updater-login-worker:slot2-yescaptcha-1.4.7
+    environment:
+      LOGIN_EXTENSION_REQUIRED: "1"
+    volumes:
+      - /opt/flow2api-token-updater-v34/extensions/slot2:/slot-extension:ro
+      - /opt/flow2api-token-updater-v34/secrets/yescaptcha-client-key:/run/yescaptcha/client_key:ro

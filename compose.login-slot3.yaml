@@ -9,7 +9,7 @@ x-common: &common
 
 x-worker: &worker
   <<: *common
-  image: flow2api-token-updater-slot3-worker:${IMAGE_TAG:-slot3}
+  image: ${LOGIN_SLOT3_WORKER_IMAGE:-flow2api-token-updater-slot3-worker:yescaptcha-key-20260925}
   security_opt:
     - no-new-privileges:true
     - seccomp:/opt/flow2api-login-slot3-build/deploy/login-worker-seccomp.json
@@ -86,6 +86,7 @@ services:
       LOGIN_WORKER_RUNTIME_DIR: /run/flow-login-worker
       DISPLAY: ":99"
       RESOLUTION: "1365x768x24"
+      LOGIN_EXTENSION_REQUIRED: "1"
       HOME: /tmp/login-worker-home
       LOG_DIR: /tmp/logs
       FLOW_URL: ${LOGIN_SLOT3_FLOW_URL:-https://flow.google.com/}
@@ -93,6 +94,8 @@ services:
       PLAYWRIGHT_BROWSERS_PATH: /root/.cache/ms-playwright
     volumes:
       - login_profile_3:/slot/profile
+      - ${LOGIN_SLOT3_EXTENSION_DIR:-./extensions/slot3}:/slot-extension:ro
+      - /opt/flow2api-token-updater-v34/secrets/yescaptcha-client-key:/run/yescaptcha/client_key:ro
       - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/control3:/control
       - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/egress3:/egress:ro
     tmpfs:

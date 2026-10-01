@@ -1,0 +1,8 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+COPY deploy/sgp011-yescaptcha/patch_live_login_worker_recovery_vnc.py /tmp/patch_recovery_vnc.py
+RUN python /tmp/patch_recovery_vnc.py /app/token_updater/login_worker.py \
+    && chmod 0644 /app/token_updater/login_worker.py
+ARG WORKER_UID
+USER ${WORKER_UID}:12000

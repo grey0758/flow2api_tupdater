@@ -1,13 +1,13 @@
-# Temporary Profile14/slot1 invitation plane. Its sidecar enforces the one-time
-# capability and scoped session cookie; it exposes no administration route.
-location = /login-slot1-reissue {
+# Temporary Profile15/slot2 invitation plane. The sidecar checks a one-time
+# capability and scoped cookie. No administration route is proxied here.
+location = /login-slot2-reissue {
     auth_basic off;
-    return 307 /login-slot1-reissue/;
+    return 307 /login-slot2-reissue/;
 }
 
-location = /login-slot1-reissue/vnc/websockify {
+location = /login-slot2-reissue/vnc/websockify {
     auth_basic off;
-    proxy_pass http://unix:/run/flow2api-login-slots/sidecar1-reissue/sidecar.sock:;
+    proxy_pass http://unix:/run/flow2api-login-slots/sidecar2-reissue/sidecar.sock:;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -18,9 +18,9 @@ location = /login-slot1-reissue/vnc/websockify {
     proxy_buffering off;
 }
 
-location ^~ /login-slot1-reissue/ {
+location ^~ /login-slot2-reissue/ {
     auth_basic off;
-    proxy_pass http://unix:/run/flow2api-login-slots/sidecar1-reissue/sidecar.sock:;
+    proxy_pass http://unix:/run/flow2api-login-slots/sidecar2-reissue/sidecar.sock:;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;

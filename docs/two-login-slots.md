@@ -3,8 +3,10 @@
 Status: **DEPLOYED FOR TWO OWNER LOGINS; ACCOUNTS NOT YET ACCEPTED**. On
 2026-09-20 UTC sgp011 changed from the single root desktop to the isolated
 release Compose. The control API remains loopback-only; the public Updater
-vhost retains independent Basic Auth and now has an exact WebSocket Upgrade
-route. Following restart-safe retirement of two lost invitations, two fresh
+vhost keeps Basic Auth for its administrator console and has an exact WebSocket
+Upgrade route. Invitation pages use a one-time token in the URL fragment,
+then a scoped HttpOnly cookie for VNC access, without a second password prompt.
+Following restart-safe retirement of two lost invitations, two fresh
 inactive candidates, Updater profiles12 and13, are currently open in slots1
 and2 for the owners. Their capability URLs are short-lived and
 must never be written to this repository. A completed visible login still is
@@ -12,21 +14,17 @@ not a Flow pool entry: real same-context provider ownership, serial extract /
 deduplication, scoped backups, exactly one sync and isolated acceptance remain
 mandatory for each identity.
 
-The shared Basic Auth policy for concurrent owner-login slots uses the
-non-secret username `flowlogin`. Its password is owner-supplied out of band;
-only the irreversible hash is stored on sgp011 in the dedicated root-managed
-file `/etc/nginx/sgp011-flow-updater-public.htpasswd`. Existing and later
-slots inherit this vhost-level authentication automatically. Do not add a
-plaintext password to Compose, environment files, this repository, logs or
-Curator. The historical raw-IP VNC entrance remains on its separate
-credential file and is not changed by slot credential rotation.
+Only the exact owner invitation paths (`/login-slots`, `/login-slots/`, and
+the dedicated sidecar prefixes) bypass Nginx Basic Auth. The application
+allows VNC assets and WebSocket traffic only after a valid one-time capability
+is claimed into a short-lived, scoped session cookie. Administrator routes
+remain behind their existing authentication. Keep capabilities out of Git,
+logs, Curator, and documentation.
 
-The workspace-approved `$send-personal-wecom` route may carry an explicitly
-scoped short-lived invitation and the owner-supplied Basic Auth fields to its
-allowlisted recipient. Keep those values only in the live command pipeline;
-do not store capabilities, plaintext passwords or provider message IDs. Do
-not put Basic Auth in URL userinfo. Send the username/password as separate
-fields beside the invitation URLs in one exact notification.
+The workspace-approved `$send-personal-wecom` route may carry the scoped,
+short-lived invitation to its allowlisted recipient. The fragment capability
+is exchanged by the page for the session cookie and immediately removed from
+browser history. Do not store invitation capabilities or provider message IDs.
 
 ## Operator workflow
 
@@ -80,9 +78,11 @@ that separate proof is available.
   other Profiles, the Docker socket or administrator secrets. Their one RW
   persistent mount each is its own named Profile volume. Runtime control and
   fixed-proxy egress are separate Unix sockets; workers use `network:none`
-  and keep the Chromium sandbox enabled. Chromium extensions are disabled;
-  do not install a CAPTCHA-solving extension or inject a solver key into a
-  login Profile. Server-side image CAPTCHA solving is an unrelated runtime
+  and keep the Chromium sandbox enabled. Each worker loads the pinned
+  YesCaptcha Assistant from its separate read-only extension mount; a missing
+  bundle fails the browser launch. The project YesCaptcha key is held in
+  OpenBao and mounted as a restricted read-only runtime copy; browser startup
+  verifies its extension configuration and balance API. Server-side image CAPTCHA solving is an unrelated runtime
   boundary and cannot be reused for Google account login.
 - The control plane alone publishes the management port on host loopback.
   Nginx must explicitly proxy Upgrade on
@@ -152,3 +152,32 @@ does not match the reviewed read-only path, keep the candidate quarantined and
 do not import it. Do not copy browser Profiles, databases, Cookies,
 credentials or runtime secrets into Git or a colleague's browser. Never sync
 or enable a new Flow token from a login report alone.
+
+## Optional five-slot automated batch
+
+The default control deployment still advertises two core slots. The optional
+`docker-compose.login-slots-five.yml` overlay adds three core slots and sets
+`LOGIN_SLOT_COUNT=5`. Logical slots 3–5 use independent `core3`–`core5` host
+control and egress directories, separate browser volumes, distinct UIDs, and
+their own read-only YesCaptcha extension bundles. The private legacy slot3
+sidecar uses its original `control3`, `egress3`, and volume, so it is not a
+source for the new core slot 3. Prepare all three extension bundles and the
+runtime key mount before a deployment. Verify Docker's merged Compose model,
+host memory and PID headroom, each worker's health, and five distinct socket
+and volume mounts before advertising five free slots.
+
+The batch operator lives in
+`deploy/sgp011-flow-account-onboarding/sgp011_flow_account_pipeline.py`.
+`batch --parallel 5 account-NNN ...` uses the smaller of five, the requested
+limit, and the control plane's free slots. It obtains passwords and TOTP seeds
+from the selected OpenBao rows, passes them through stdin and signed local
+sockets to visible Chromium, and stops on any unfamiliar Google challenge.
+If a human step is needed, it sends the existing one-time VNC invitation to
+the owner and leaves that Profile unsynced. The same-context provider project
+gate remains mandatory. Guarded receiver sync, paid acceptance, and
+enablement are serialized. Uncertain side effects are recorded as review
+states and require reconciliation of original evidence before any retry.
+
+This overlay and automation have source-level tests; they have not been
+deployed or qualified against live accounts by this source update. The
+retained private Profile53 SMS session must remain available during rollout.

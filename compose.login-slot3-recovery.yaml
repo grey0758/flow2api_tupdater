@@ -35,7 +35,7 @@ services:
 
   login-worker-3:
     <<: *common
-    image: ${LOGIN_SLOT3_WORKER_IMAGE:?recovery worker image required}
+    image: ${LOGIN_SLOT3_WORKER_IMAGE:-flow2api-token-updater-slot3-worker:id11-yescaptcha-key-vnc-recover-20260925}
     container_name: flow-login-worker-3
     user: "11003:12000"
     security_opt:
@@ -59,6 +59,7 @@ services:
       LOGIN_WORKER_RUNTIME_DIR: /run/flow-login-worker
       DISPLAY: ":99"
       RESOLUTION: "1365x768x24"
+      LOGIN_EXTENSION_REQUIRED: "1"
       HOME: /tmp/login-worker-home
       LOG_DIR: /tmp/logs
       FLOW_URL: ${LOGIN_SLOT3_FLOW_URL:-https://flow.google.com/}
@@ -66,6 +67,8 @@ services:
       PLAYWRIGHT_BROWSERS_PATH: /root/.cache/ms-playwright
     volumes:
       - ${LOGIN_SLOT3_PROFILE_SOURCE:?existing profile path required}:/slot/profile
+      - ${LOGIN_SLOT3_EXTENSION_DIR:-./extensions/slot3}:/slot-extension:ro
+      - /opt/flow2api-token-updater-v34/secrets/yescaptcha-client-key:/run/yescaptcha/client_key:ro
       - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/control3:/control
       - ${LOGIN_SLOT_RUNTIME_ROOT:-/run/flow2api-login-slots}/egress3:/egress:ro
     tmpfs:

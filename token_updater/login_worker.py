@@ -28,6 +28,8 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket
 from playwright.async_api import BrowserContext, Response, async_playwright
 
 from .browser_profile import configure_web_only_profile
+from .browser_extensions import configure_yescaptcha, visible_browser_extension_options
+from .google_login_automation import login_google
 from .login_worker_protocol import ReplayGuard
 from .proxy_utils import format_proxy_for_playwright, parse_proxy
 from .session_validation import (
@@ -60,6 +62,8 @@ LABS_AUTH_URL = os.getenv(
 RUNTIME_DIR = Path(os.getenv("LOGIN_WORKER_RUNTIME_DIR", "/run/flow-login-worker"))
 XAUTHORITY = RUNTIME_DIR / ".Xauthority"
 HOME_DIR = Path(os.getenv("HOME", "/tmp/login-worker-home"))
+EXTENSION_DIR = Path("/slot-extension")
+EXTENSION_REQUIRED = os.getenv("LOGIN_EXTENSION_REQUIRED") == "1"
 
 LOGIN_BROWSER_ARGS = [
     "--disable-extensions",
@@ -67,6 +71,16 @@ LOGIN_BROWSER_ARGS = [
     "--no-first-run",
     "--no-default-browser-check",
 ]
+
+
+def login_browser_options(extension_dir: Path = EXTENSION_DIR) -> tuple[list[str], list[str]]:
+    """Return Chromium flags for this slot's optional, read-only extension."""
+    return visible_browser_extension_options(
+        LOGIN_BROWSER_ARGS,
+        ["--enable-automation", "--no-sandbox", "--disable-dev-shm-usage"],
+        extension_dir,
+        required=EXTENSION_REQUIRED,
+    )
 
 PROJECT_API_PATH = re.compile(r"^/fx/api/trpc/project\.[A-Za-z0-9_.-]+$")
 PROJECT_DOCUMENT_PATH = re.compile(
@@ -133,6 +147,15 @@ PROJECT_MEDIA_WORKSPACE_MARKERS = (
 PROJECT_MEDIA_WORKSPACE_PROMPTS = (
     "what would you like to create?",
     "what do you want to create?",
+)
+PROJECT_MEDIA_WORKSPACE_VI_MARKERS = (
+    "nhân vật",
+    "cảnh",
+    "công cụ",
+)
+PROJECT_MEDIA_WORKSPACE_VI_PROMPTS = (
+    "bạn muốn tạo gì?",
+    "bắt đầu tạo hoặc thả nội dung",
 )
 GOOGLE_LOGIN_CHALLENGE_HOSTS = frozenset({
     "accounts.google.com",
@@ -496,6 +519,7 @@ class LoginWorker:
                     return
                 self._probe_count("known_success_envelope")
                 if is_modern_user_project_list:
+                    self._probe_count("user_list_success_envelope")
                     matched_ids = {
                         str(UUID(match.group(0)))
                         for match in UUID_TEXT_PATTERN.finditer(document)
@@ -557,7 +581,14 @@ class LoginWorker:
                         prompt in normalized_body
                         for prompt in PROJECT_MEDIA_WORKSPACE_PROMPTS
                     )
-                    if has_editor or has_media_workspace:
+                    has_vietnamese_workspace = all(
+                        marker in normalized_body
+                        for marker in PROJECT_MEDIA_WORKSPACE_VI_MARKERS
+                    ) and any(
+                        prompt in normalized_body
+                        for prompt in PROJECT_MEDIA_WORKSPACE_VI_PROMPTS
+                    )
+                    if has_editor or has_media_workspace or has_vietnamese_workspace:
                         return True
                     await asyncio.sleep(0.5)
             except Exception:
@@ -676,6 +707,7 @@ class LoginWorker:
             if not parsed:
                 raise RuntimeError("assigned source proxy is invalid")
             proxy = format_proxy_for_playwright(parsed)
+        browser_args, ignored_defaults = login_browser_options()
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
             headless=False,
@@ -684,11 +716,15 @@ class LoginWorker:
             locale="en-US",
             timezone_id="America/New_York",
             proxy=proxy,
-            args=LOGIN_BROWSER_ARGS,
-            ignore_default_args=[
-                "--enable-automation", "--no-sandbox", "--disable-dev-shm-usage",
-            ],
+            args=browser_args,
+            ignore_default_args=ignored_defaults,
         )
+        try:
+            await configure_yescaptcha(self.context)
+        except Exception:
+            await self.context.close()
+            self.context = None
+            raise
         self.context.on("response", self._record_provider_project_response)
         pages = list(self.context.pages)
         # A recovered browser may already be inside its own Flow project.
@@ -767,6 +803,92 @@ class LoginWorker:
         if generation != self.generation or profile_id != self.profile_id:
             raise HTTPException(409, "worker assignment does not match")
 
+    async def auto_login(self, generation: str, profile_id: int, email: str,
+                         password: str, totp_seed: str) -> dict:
+        """Drive only known Google forms in this slot's visible Chromium."""
+        async with self.lock:
+            self._scope(generation, profile_id)
+            if self.state != "ready" or self.context is None:
+                raise HTTPException(409, "browser is not ready")
+            expected = self._normalize_email(email)
+            if not expected or not password or not totp_seed:
+                return {**self.public(), "success": False, "error_code": "credentials_invalid"}
+            self.state = "automating_login"
+            try:
+                current = await self._validate_context_session("")
+                if current.get("success"):
+                    if self._normalize_email(current.get("email")) != expected:
+                        return {**self.public(), "success": False,
+                                "error_code": "existing_identity_mismatch"}
+                elif current.get("error_code") == "auth_required":
+                    stage = await login_google(self.context, expected, password,
+                                               totp_seed, LABS_AUTH_URL)
+                    if stage not in {"credentials_submitted", "existing_session_or_review"}:
+                        return {**self.public(), "success": False, "error_code": stage,
+                                "requires_manual_action": stage == "manual_action_required"}
+                else:
+                    return {**self.public(), "success": False,
+                            "error_code": "session_precheck_unavailable"}
+                labs_page = await self.context.new_page()
+                await labs_page.goto("https://labs.google/fx", wait_until="domcontentloaded",
+                                     timeout=90000)
+                confirmed = await self._validate_context_session(expected)
+                if not confirmed.get("success"):
+                    return {**self.public(), "success": False,
+                            "error_code": "labs_identity_unverified"}
+                self.provider_project_ids.clear()
+                self.project_probe_counts.clear()
+                self.project_probe_rpc_ids.clear()
+                flow_page = await self.context.new_page()
+                await flow_page.goto(MODERN_FLOW_HOME_URL,
+                                     wait_until="domcontentloaded", timeout=90000)
+                if "/unsupported-country" in urlparse(flow_page.url).path:
+                    return {**self.public(), "success": False,
+                            "error_code": "flow_region_restricted"}
+                if urlparse(flow_page.url).hostname != "flow.google.com":
+                    return {**self.public(), "success": False,
+                            "error_code": "flow_auth_review"}
+                for _ in range(40):
+                    if self.project_probe_counts.get("user_list_success_envelope", 0):
+                        break
+                    await asyncio.sleep(0.5)
+                projects = set(self.provider_project_ids)
+                if len(projects) == 1:
+                    project_id = next(iter(projects))
+                    await flow_page.goto(f"https://flow.google.com/project/{project_id}",
+                                         wait_until="domcontentloaded", timeout=90000)
+                elif len(projects) == 0 and (
+                    self.project_probe_counts.get("user_list_success_envelope", 0)
+                ):
+                    # Create once only after an authenticated empty provider
+                    # project list. A rerun reads membership before clicking.
+                    button = flow_page.locator(
+                        'button:has-text("New project"), a:has-text("New project"), '
+                        'button:has-text("新建项目"), a:has-text("新建项目"), '
+                        'button:has-text("Dự án mới"), a:has-text("Dự án mới")'
+                    )
+                    if await button.count() != 1:
+                        return {**self.public(), "success": False,
+                                "error_code": "project_action_required"}
+                    await button.click()
+                    for _ in range(30):
+                        if any(_project_id_from_url(page.url) for page in self.context.pages):
+                            break
+                        await asyncio.sleep(1)
+                else:
+                    return {**self.public(), "success": False,
+                            "error_code": "project_action_required"}
+                if not any(_project_id_from_url(page.url) for page in self.context.pages):
+                    return {**self.public(), "success": False,
+                            "error_code": "project_action_required"}
+                return {**self.public(), "success": True,
+                        "stage": "ready_for_project_validation"}
+            except Exception:
+                return {**self.public(), "success": False,
+                        "error_code": "login_automation_review"}
+            finally:
+                self.state = "ready"
+
     async def assign(self, generation: str, profile_id: int, proxy_url: str) -> dict:
         async with self.lock:
             if self.state != "idle" or self.context is not None:
@@ -823,6 +945,9 @@ class LoginWorker:
             self.validation_candidate_ids.clear()
             self.state = "starting_browser"
             try:
+                # Reconciliation abort stops x11vnc. Restore the desktop
+                # listener before reopening the retained browser Profile.
+                await self._start_vnc()
                 await self._open_browser()
             except Exception:
                 self.state = "quarantined"
@@ -1297,6 +1422,19 @@ async def validate(request: Request) -> dict:
         profile_id,
         str(payload.get("expected_existing_project_id") or ""),
     )
+
+
+@app.post("/auto-login")
+async def auto_login(request: Request) -> dict:
+    generation, profile_id, payload = await _authorized(request, "/auto-login")
+    result = await worker.auto_login(
+        generation, profile_id,
+        str(payload.get("email") or ""),
+        str(payload.get("password") or ""),
+        str(payload.get("totp_seed") or ""),
+    )
+    result["state"] = worker.state
+    return result
 
 
 @app.post("/validate-account-projects")

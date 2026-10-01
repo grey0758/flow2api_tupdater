@@ -3,7 +3,8 @@
 This process deliberately has no Updater database, scheduler, or application
 network access.  It assigns one already-prepared Profile to worker slot 3,
 keeps the owner session in memory, and exposes only the isolated desktop
-through the existing HTTPS/Basic-Auth vhost.  A restart never reconstructs a
+through the existing HTTPS vhost with a one-time capability and session cookie.
+A restart never reconstructs a
 session: a non-empty worker Profile makes the slot quarantine instead.
 """
 

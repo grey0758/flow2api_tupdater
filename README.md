@@ -26,19 +26,21 @@ Flow2API Token Updater 是一个轻量级的多账号令牌刷新工具。
 - 智能同步：按最终生效的 Flow2API 地址和令牌分组
 - 单账号覆盖：每个 Profile 都可以覆盖目标地址和连接令牌
 - 代理支持：每个 Profile 都可以使用独立代理
-- **两个独立人工登录槽位**：固定两套 Chromium/Xvfb/noVNC，可让两名 owner
+- **独立登录槽位**：默认两套 Chromium/Xvfb/noVNC；可选五槽位部署用于最多五路并发导入，让多名 owner
   同时完成不同新 Profile 的可见登录；同步与账号验收仍严格串行
 
 并发登录的操作与安全边界见
-[Two concurrent owner-login slots](docs/two-login-slots.md)。管理员登录后可从
+[Isolated owner-login slots](docs/two-login-slots.md)。管理员登录后可从
 控制台进入 `/account-import`。邀请页面不提供同步、Cookie 导出或账号启用能力。
 
 sgp011 的 OpenBao 批量导入、邀请、去重、单次同步、独立图片验收与显式启用
 由 [生产账号导入流水线](deploy/sgp011-flow-account-onboarding/README.md) 分阶段执行。
-该流水线刻意不读取或自动填写 Google 密码、TOTP/MFA，也不处理 CAPTCHA、设备
-确认、恢复挑战或 consent；这些步骤始终由账号 owner 在独立 VNC 中可见完成。
-登录 worker 强制禁用扩展，不会安装 YesCaptcha 或其他打码扩展，也不会从
-OpenBao 读取打码密钥注入浏览器。登录检查识别到 Google 挑战时，只返回
+批量流水线从 OpenBao 在内存中读取密码与 TOTP 种子，只在对应的可见独立 VNC
+中处理已知的 Google 登录表单。CAPTCHA、短信、设备确认、恢复挑战和未知页面会停在
+该 VNC，交由 owner 处理；每个账号仍需真实项目归属、单次同步和单次图片验收。
+v3.4 主 VNC 和每个独立登录槽位默认加载固定版本的 YesCaptcha Assistant；
+每个槽位使用自己的只读扩展目录，以后创建的 Profile 也沿用该槽位配置。
+登录浏览器启动时从受限运行时密钥挂载配置 YesCaptcha 扩展。登录检查识别到 Google 挑战时，只返回
 `manual_action_required` 并保留原 Profile/VNC；人工完成后可对同一上下文再做无成本检查。
 生图运行时的服务端 YesCaptcha 是独立边界，不得复用于 Google 账号登录。
 

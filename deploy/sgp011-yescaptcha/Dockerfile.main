@@ -1,0 +1,6 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+COPY token_updater/browser.py /app/token_updater/browser.py
+COPY token_updater/browser_extensions.py /app/token_updater/browser_extensions.py
+RUN chmod 0644 /app/token_updater/browser.py /app/token_updater/browser_extensions.py

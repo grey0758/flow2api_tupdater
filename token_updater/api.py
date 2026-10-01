@@ -885,9 +885,35 @@ async def recover_login_slot(number: int, profile_id: int, token: str = Depends(
     }
 
 
+@app.post("/api/login-slots/{profile_id}/auto-login")
+async def auto_login_slot(profile_id: int, request: Request,
+                          token: str = Depends(verify_session)):
+    # Use a raw request so validation failures never echo credential fields.
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "凭据请求格式无效") from None
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "凭据请求格式无效")
+    email = payload.get("email")
+    password = payload.get("password")
+    totp_seed = payload.get("totp_seed")
+    if not all(isinstance(value, str) for value in (email, password, totp_seed)) or any(
+        len(value) > limit for value, limit in ((email, 320), (password, 1024), (totp_seed, 256))
+    ):
+        raise HTTPException(400, "凭据请求格式无效")
+    slot = await login_slots.get_profile_slot(profile_id)
+    if slot is None:
+        raise HTTPException(404, "独立登录槽位不存在")
+    try:
+        return await login_slots.auto_login(slot, email, password, totp_seed)
+    except LoginSlotError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
+
 @app.delete("/api/login-slots/{number}")
 async def cancel_login_slot(number: int, token: str = Depends(verify_session)):
-    slot = await login_slots.get_slot(number) if number in {1, 2} else None
+    slot = await login_slots.get_slot(number) if number in login_slots.numbers() else None
     if not slot:
         raise HTTPException(404, "槽位不存在")
     await login_slots.release(number, expected=slot)

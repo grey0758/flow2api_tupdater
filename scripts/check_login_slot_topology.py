@@ -12,13 +12,19 @@ def fail(message):
 
 data = json.load(sys.stdin)
 services = data.get("services", {})
-workers = [services.get("login-worker-1"), services.get("login-worker-2")]
+control = services.get("token-updater", {})
+count = int(control.get("environment", {}).get("LOGIN_SLOT_COUNT", "2"))
+if count not in {2, 5}:
+    fail("only the reviewed two-slot or five-slot topology is allowed")
+workers = [services.get(f"login-worker-{number}") for number in range(1, count + 1)]
 if any(not isinstance(worker, dict) for worker in workers):
-    fail("two login workers are required")
+    fail("configured login workers are required")
 
 profile_sources = []
+control_sources = []
 for number, worker in enumerate(workers, 1):
-    if str(worker.get("user")) != f"1100{number}:12000":
+    expected_uid = 11000 + (number if number < 3 else number + 1)
+    if str(worker.get("user")) != f"{expected_uid}:12000":
         fail(f"worker {number} must use its dedicated non-root uid")
     if worker.get("network_mode") != "none" or worker.get("read_only") is not True:
         fail(f"worker {number} must be network-none and rootfs-readonly")
@@ -36,6 +42,7 @@ for number, worker in enumerate(workers, 1):
         "LOGIN_EGRESS_SOCKET", "LOGIN_PROFILE_DIR",
         "LOGIN_SLOT_NUMBER", "LOGIN_SLOT_SIGNING_PUBLIC_KEY", "LOGIN_WORKER_RUNTIME_DIR",
         "LOGIN_WORKER_SOCKET", "LOG_DIR", "PLAYWRIGHT_BROWSERS_PATH", "RESOLUTION",
+        "LOGIN_EXTENSION_REQUIRED",
     }
     if set(env) - allowed_env:
         fail(f"worker {number} received an unexpected environment field")
@@ -58,8 +65,13 @@ for number, worker in enumerate(workers, 1):
             if mount.get("type") != "bind":
                 fail(f"worker {number} runtime sockets must use non-persistent binds")
             runtime_targets.add(target)
+            if target == "/control":
+                control_sources.append(mount.get("source"))
             if target == "/egress" and not mount.get("read_only", False):
                 fail(f"worker {number} egress socket bind must be read-only")
+        elif target in {"/slot-extension", "/run/yescaptcha/client_key"}:
+            if mount.get("type") != "bind" or not mount.get("read_only", False):
+                fail(f"worker {number} extension/key mount must be read-only bind")
         else:
             fail(f"worker {number} received unexpected mount {target}")
     if len(rw_profiles) != 1:
@@ -71,10 +83,9 @@ for number, worker in enumerate(workers, 1):
         fail(f"worker {number} is missing an isolated tmpfs path")
     profile_sources.extend(rw_profiles)
 
-if len(set(profile_sources)) != 2:
+if len(set(profile_sources)) != count or len(set(control_sources)) != count:
     fail("workers must use different Profile volumes")
 
-control = services.get("token-updater", {})
 published = control.get("ports", [])
 if len(published) != 1 or published[0].get("host_ip") != "127.0.0.1":
     fail("only the control API may be published on loopback")

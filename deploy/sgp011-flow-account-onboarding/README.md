@@ -1,10 +1,12 @@
 # sgp011 Flow account onboarding automation
 
-This directory preserves the non-secret, production-safe part of the account
-onboarding workflow. It deliberately does not automate Google account choice,
-password entry, TOTP/MFA, CAPTCHA, device confirmation, recovery challenges or
-consent. Those actions remain visible owner actions in the dedicated isolated
-VNC desktop.
+The `batch` command runs the account import from code. It reads each selected
+OpenBao record in memory, prepares a separate Profile and worker, enters the
+password and a fresh Authenticator TOTP on recognized Google pages, opens Labs
+and Flow, and checks the exact identity. An authenticated empty project list
+permits one New project click. Unknown pages, CAPTCHA, SMS, device/recovery
+checks and consent remain visible in the same VNC for owner review. A batch
+failure never submits a second sync or paid image automatically.
 
 The login workers launch headed Chromium with the pinned YesCaptcha Assistant
 Manifest V3 extension from their separate read-only `/slot-extension` mounts.
@@ -22,10 +24,12 @@ The reusable pipeline is:
 1. Store each owner-supplied account as one versioned OpenBao KV v2 record.
 2. Prepare an inactive, credential-empty Profile through the Updater
    `/api/login-slots/prepare` endpoint.
-3. Start one of the two isolated login workers and send its memory-only
-   invitation directly through the approved personal WeCom sender.
-4. After the owner completes Google/Flow and Labs authorization, run exactly
-   one `sudo /usr/local/sbin/sgp011-flow-onboard-profile <PROFILE_ID>`.
+3. Start an isolated login worker, automate only the recognized Google forms,
+   and validate the same browser's identity and provider project membership.
+   Send the memory-only invitation through personal WeCom if intervention is
+   needed.
+4. After the supported Profile handoff, run exactly one guarded
+   `sudo /usr/local/sbin/sgp011-flow-onboard-profile <PROFILE_ID>`.
 5. For the returned disabled pending Flow token, run exactly one
    `sudo /usr/local/sbin/sgp011-flow-account-health-run --pending-token-id
    <FLOW_TOKEN_ID>`.
@@ -55,6 +59,7 @@ their risk boundaries:
 
 ```text
 sgp011_flow_account_pipeline.py status
+sgp011_flow_account_pipeline.py batch --parallel 5 account-NNN account-MMM
 sgp011_flow_account_pipeline.py prepare-invite --record-id account-NNN --profile-name <NAME>
 sgp011_flow_account_pipeline.py onboard --record-id account-NNN --profile-id <PROFILE_ID>
 sgp011_flow_account_pipeline.py accept --record-id account-NNN --profile-id <PROFILE_ID> --token-id <FLOW_TOKEN_ID>
@@ -68,6 +73,24 @@ pending token. `accept` is the one explicitly selected paid image. `enable`
 requires a unique completed pending-image evidence directory before changing
 the token/Profile pair and compensates by disabling the token if Profile
 enablement fails.
+
+`batch` accepts only distinct `pending` records. Its actual concurrency is
+the smaller of `--parallel`, five, and the control plane's currently free
+slots. Browser login and project checks run concurrently. Guarded receiver
+sync, paid image acceptance, and activation run serially. Record states mark
+`preparing`, `onboarding_running`, `image_acceptance_running`, and
+`enable_running` before their external side effects; an uncertain result is
+left for operator reconciliation. `image_acceptance_review` must be checked
+against the original root-only report before any further request. Automatic
+challenge handling never bypasses Google's manual checks.
+
+The default deployment exposes two core slots. The optional
+`docker-compose.login-slots-five.yml` overlay adds three isolated core slots,
+each with its own browser volume, control/egress socket, UID, extension mount,
+and resource limits. The extra core slots use `core3`–`core5` host paths so
+the retained private slot3 sidecar is not touched. Stage those extension
+bundles and verify the host's capacity before enabling the overlay. The
+five-slot overlay is source code until separately deployed and verified.
 
 Every mutating stage first requires the exact OpenBao state transition and
 record-to-Profile-to-Token binding. `onboard` additionally passes the expected

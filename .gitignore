@@ -13,6 +13,12 @@ data/
 profiles/
 logs/
 backups/
+extensions/slot*/**
+!extensions/slot*/.gitkeep
+extensions/core*/**
+extensions/main/**
+!extensions/main/.gitkeep
+extensions/*.crx
 
 dist/
 build/

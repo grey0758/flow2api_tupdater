@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import os
 import time
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 from token_updater.login_slots import LoginSlot, LoginSlotError, LoginSlots
 from token_updater.login_worker_protocol import ReplayGuard, sign_headers
@@ -78,6 +80,20 @@ def _worker_reply(slot, state="ready", browser=True, **extra):
         "browser_running": browser,
         **extra,
     }
+
+
+def test_five_slot_configuration_keeps_independent_worker_sockets(monkeypatch):
+    from token_updater import login_slots as module
+    monkeypatch.setattr(module.config, "login_slot_worker_ids", (11001, 11002, 11004, 11005, 11006))
+    monkeypatch.setattr(module.config, "login_slot_worker_sockets", tuple(
+        f"/run/core{number}/worker.sock" for number in range(1, 6)
+    ))
+    monkeypatch.setattr(module.config, "login_slot_worker_proxy_urls", (
+        "http://127.0.0.1:18088",
+    ) * 5)
+    manager = LoginSlots()
+    assert [slot["slot"] for slot in manager.status()] == [1, 2, 3, 4, 5]
+    assert len(set(module.config.login_slot_worker_sockets)) == 5
 
 
 def test_abort_response_accepts_only_cleared_terminal_scope(monkeypatch):
@@ -455,6 +471,37 @@ async def test_recover_exact_expired_slot_without_reusing_invitation(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_worker_recovery_restores_vnc_before_browser(monkeypatch, tmp_path):
+    """A reconciled slot can have a browser-ready Profile with VNC stopped."""
+    monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
+    monkeypatch.setenv("LOGIN_SLOT_NUMBER", "1")
+    from token_updater import login_worker as module
+
+    (tmp_path / "retained-state").write_text("private")
+    worker = module.LoginWorker()
+    worker.state = "quarantined"
+    monkeypatch.setattr(worker, "_safe_profile_dir", lambda: tmp_path)
+    monkeypatch.setattr(worker, "_profile_browser_processes", AsyncMock(return_value=[]))
+    monkeypatch.setattr(worker, "_remove_stale_browser_locks", MagicMock())
+    order = []
+
+    async def start_vnc():
+        order.append("vnc")
+
+    async def open_browser():
+        order.append("browser")
+        worker.context = SimpleNamespace()
+
+    monkeypatch.setattr(worker, "_start_vnc", start_vnc)
+    monkeypatch.setattr(worker, "_open_browser", open_browser)
+
+    result = await worker.recover("new-generation", 18, "http://127.0.0.1:18088")
+
+    assert order == ["vnc", "browser"]
+    assert result["state"] == "ready" and result["browser_running"] is True
+
+
+@pytest.mark.asyncio
 async def test_recover_rejects_unexpired_or_completed_profile(monkeypatch, tmp_path):
     _, root = _slot_tree(tmp_path, monkeypatch)
     (root / "slot1" / "profile" / "retained-state").write_text("private")
@@ -528,6 +575,36 @@ def test_login_surface_has_no_sync_or_cookie_export_controls():
     assert 'src="/login-slots/client.js"' in page
 
 
+def test_invite_token_claims_scoped_cookie_without_admin_login(monkeypatch):
+    from token_updater import api as module
+
+    manager = LoginSlots()
+    slot = LoginSlot(1, 61, "one-time-capability", time.time() + 180, state="ready")
+    manager._slots[1] = slot
+    monkeypatch.setattr(module, "login_slots", manager)
+    monkeypatch.setattr(module.config, "admin_password", "admin-secret-for-test")
+    with TestClient(module.app, base_url="https://flow-updater.opencodex.uk") as client:
+        assert client.get("/login-slots").status_code == 200
+        assert client.get("/login-slots/client.js").status_code == 200
+        assert client.get("/login-slots/session").status_code == 401
+        assert client.get("/login-slots/vnc/vnc.html").status_code == 401
+        assert client.get("/api/profiles").status_code == 401
+        claimed = client.post(
+            "/login-slots/claim",
+            json={"capability": "one-time-capability"},
+            headers={"origin": "https://flow-updater.opencodex.uk"},
+        )
+        assert claimed.status_code == 200
+        assert claimed.cookies.get("flow_login_slot")
+        assert "httponly" in claimed.headers["set-cookie"].lower()
+        assert client.get("/login-slots/session").json() == {"slot": 1, "state": "ready"}
+        assert client.post(
+            "/login-slots/claim",
+            json={"capability": "one-time-capability"},
+            headers={"origin": "https://flow-updater.opencodex.uk"},
+        ).status_code == 409
+
+
 def test_final_topology_declares_two_non_root_profile_workers():
     root = Path(__file__).parents[1]
     compose = (root / "docker-compose.login-slots.yml").read_text()
@@ -546,11 +623,69 @@ def test_final_topology_declares_two_non_root_profile_workers():
     assert "/app/data:ro,nosuid,nodev,noexec" in worker_one
     assert '"--enable-automation", "--no-sandbox", "--disable-dev-shm-usage"' in worker
     assert '"--disable-extensions"' in worker
-    assert "--load-extension" not in worker
+    for number in (1, 2):
+        assert f"${{LOGIN_SLOT{number}_EXTENSION_DIR:-./extensions/slot{number}}}:/slot-extension:ro" in compose
     assert "--disable-setuid-sandbox" not in worker
     assert "USER ${WORKER_UID}:12000" in dockerfile
     assert "FROM scratch" in dockerfile
     assert "seccomp:deploy/login-worker-seccomp.json" in compose
+
+
+def test_login_slot_extension_is_optional_and_scoped(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
+    monkeypatch.setenv("LOGIN_SLOT_NUMBER", "1")
+    from token_updater.login_worker import login_browser_options
+
+    slot1 = tmp_path / "slot1"
+    slot2 = tmp_path / "slot2"
+    slot1.mkdir()
+    slot2.mkdir()
+    (slot1 / ".gitkeep").touch()
+    plain_args, plain_ignored = login_browser_options(slot1)
+    assert "--disable-extensions" in plain_args
+    assert "--disable-extensions" not in plain_ignored
+
+    (slot2 / "manifest.json").write_text(json.dumps({
+        "manifest_version": 3, "name": "Slot test", "version": "1.0",
+    }))
+    extension_args, extension_ignored = login_browser_options(slot2)
+    assert "--disable-extensions" not in extension_args
+    assert f"--disable-extensions-except={slot2}" in extension_args
+    assert f"--load-extension={slot2}" in extension_args
+    assert "--disable-extensions" in extension_ignored
+    assert "--load-extension" not in " ".join(plain_args)
+
+
+def test_login_slot_extension_rejects_partial_or_invalid_bundle(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
+    monkeypatch.setenv("LOGIN_SLOT_NUMBER", "1")
+    from token_updater.login_worker import login_browser_options
+
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    (slot / "extension.crx").write_bytes(b"not an unpacked extension")
+    with pytest.raises(RuntimeError, match="manifest.json is missing"):
+        login_browser_options(slot)
+    (slot / "extension.crx").unlink()
+    (slot / "manifest.json").write_text('{"manifest_version":2,"name":"old","version":"1"}')
+    with pytest.raises(RuntimeError, match="Manifest V3"):
+        login_browser_options(slot)
+
+
+def test_slot3_extension_mount_is_read_only():
+    root = Path(__file__).parents[1]
+    for name in ("compose.login-slot3.yaml", "compose.login-slot3-recovery.yaml"):
+        compose = (root / name).read_text()
+        assert "${LOGIN_SLOT3_EXTENSION_DIR:-./extensions/slot3}:/slot-extension:ro" in compose
+
+
+def test_required_slot_extension_missing_fails_closed(tmp_path):
+    from token_updater.browser_extensions import visible_browser_extension_options
+
+    with pytest.raises(RuntimeError, match="required VNC extension"):
+        visible_browser_extension_options(
+            ["--disable-extensions"], [], tmp_path / "missing", required=True,
+        )
 
 
 def test_worker_project_gate_requires_authenticated_provider_response():
@@ -1021,6 +1156,10 @@ async def test_worker_probes_current_user_membership_in_disposable_home_tab(monk
         "What would you like to\ncreate?",
         "All media\nImages\nCharacters\nScenes\nUploads\nTools\n"
         "What do you want to\ncreate?",
+        "Tất cả nội dung nghe nhìn\nNhân vật\nCảnh\nCông cụ\n"
+        "Bạn muốn tạo gì?",
+        "Tất cả nội dung nghe nhìn\nNhân vật\nCảnh\nCông cụ\n"
+        "Bắt đầu tạo hoặc thả nội dung nghe nhìn",
     ],
 )
 async def test_worker_requires_rendered_project_access(monkeypatch, editor_text):
@@ -1121,10 +1260,13 @@ async def test_worker_reloads_exact_project_document_before_current_identity_gat
 def test_worker_existing_project_validation_is_database_bound_and_read_only():
     root = Path(__file__).parents[1]
     source = (root / "token_updater/login_worker.py").read_text()
-    assert "expected_existing_project_id" in source
-    assert 'https://flow.google.com/project/{expected_project_id}' in source
-    assert "candidates &= {expected_project_id}" in source
-    assert "New project" not in source
+    validate = source.split("    async def validate(", 1)[1].split(
+        "    async def validate_account_projects(", 1
+    )[0]
+    assert "expected_existing_project_id" in validate
+    assert 'https://flow.google.com/project/{expected_project_id}' in validate
+    assert "candidates &= {expected_project_id}" in validate
+    assert "New project" not in validate
 
 
 def test_worker_account_project_membership_returns_no_project_identifiers():
@@ -1159,8 +1301,11 @@ async def test_worker_opens_flow_and_labs_auth_tabs(monkeypatch, tmp_path):
     worker.provider_project_ids = set()
     monkeypatch.setattr(module.LoginWorker, "_safe_profile_dir", staticmethod(lambda: tmp_path))
     monkeypatch.setattr(module, "configure_web_only_profile", lambda _: None)
+    extension_check = AsyncMock()
+    monkeypatch.setattr(module, "configure_yescaptcha", extension_check)
 
     await worker._open_browser()
+    extension_check.assert_awaited_once_with(context)
 
     flow_page.goto.assert_awaited_once_with(
         module.FLOW_URL, wait_until="domcontentloaded", timeout=90000,
@@ -1197,8 +1342,11 @@ async def test_worker_recovery_preserves_existing_project_tab(monkeypatch, tmp_p
     worker.provider_project_ids = set()
     monkeypatch.setattr(module.LoginWorker, "_safe_profile_dir", staticmethod(lambda: tmp_path))
     monkeypatch.setattr(module, "configure_web_only_profile", lambda _: None)
+    extension_check = AsyncMock()
+    monkeypatch.setattr(module, "configure_yescaptcha", extension_check)
 
     await worker._open_browser()
+    extension_check.assert_awaited_once_with(context)
 
     project_page.goto.assert_not_awaited()
     labs_page.goto.assert_not_awaited()
