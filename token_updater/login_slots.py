@@ -56,6 +56,7 @@ class LoginSlots:
         self._slots: dict[int, LoginSlot] = {}
         self._expiry_tasks: dict[int, asyncio.Task] = {}
         self._blocked_profiles: set[int] = set()
+        self._unbound_profiles: set[int] = set()
         self._quarantined_numbers: set[int] = set()
         self._reconciled = False
 
@@ -93,7 +94,9 @@ class LoginSlots:
                 raise RuntimeError(f"multiple unfinished Profiles claim login slot {number}")
             claimed_by_number[number] = profile
 
-        quarantined = set()
+        # A durable unfinished claim reserves its original slot even if its
+        # volume is unexpectedly empty. Never give that number to a new owner.
+        quarantined = set(claimed_by_number)
         for number, uid in enumerate(config.login_slot_worker_ids, 1):
             stage, _ = self._slot_paths(number, 0)
             if not stage.is_dir() or stage.is_symlink() or stage.stat().st_uid != uid:
@@ -129,6 +132,9 @@ class LoginSlots:
             if self._slots:
                 raise RuntimeError("cannot reconcile live login invitations")
             self._blocked_profiles = blocked
+            self._unbound_profiles = blocked - {
+                int(profile["id"]) for profile in claimed_by_number.values()
+            }
             self._quarantined_numbers = quarantined
             self._reconciled = True
 
@@ -144,11 +150,10 @@ class LoginSlots:
         return number in self._slots
 
     def status(self) -> list[dict]:
-        active_profiles = {slot.profile_id for slot in self._slots.values()}
-        orphaned = bool(self._blocked_profiles - active_profiles)
+        unbound = bool(self._unbound_profiles)
         return [
             self._slots[number].public() if number in self._slots
-            else {"slot": number, "state": "quarantined" if orphaned or number in self._quarantined_numbers else "free"}
+            else {"slot": number, "state": "quarantined" if unbound or number in self._quarantined_numbers else "free"}
             for number in self.numbers()
         ]
 
@@ -360,9 +365,8 @@ class LoginSlots:
                     raise LoginSlotError(409, "该 Profile 已占用一个槽位")
                 if profile_id in self._blocked_profiles:
                     raise LoginSlotError(409, "该 Profile 的旧邀请仍在隔离等待管理员处理")
-                active_profiles = {slot.profile_id for slot in self._slots.values()}
-                if self._blocked_profiles - active_profiles:
-                    raise LoginSlotError(503, "存在重启后未完成的 Profile 交接，暂停新邀请")
+                if self._unbound_profiles:
+                    raise LoginSlotError(503, "存在槽位归属不明的未完成 Profile")
                 from .browser import browser_manager
                 from .updater import token_syncer
                 if token_syncer.is_syncing():

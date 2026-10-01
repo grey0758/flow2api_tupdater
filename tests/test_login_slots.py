@@ -96,6 +96,25 @@ def test_five_slot_configuration_keeps_independent_worker_sockets(monkeypatch):
     assert len(set(module.config.login_slot_worker_sockets)) == 5
 
 
+def test_bound_quarantined_profiles_leave_other_slots_free(monkeypatch):
+    from token_updater import login_slots as module
+    monkeypatch.setattr(module.config, "login_slot_worker_ids", (11001, 11002, 11004, 11005, 11006))
+    monkeypatch.setattr(module.config, "login_slot_worker_sockets", tuple(
+        f"/run/core{number}/worker.sock" for number in range(1, 6)
+    ))
+    monkeypatch.setattr(module.config, "login_slot_worker_proxy_urls", (
+        "http://127.0.0.1:18088",
+    ) * 5)
+    manager = LoginSlots()
+    manager._blocked_profiles = {18, 19}
+    manager._quarantined_numbers = {1, 2}
+    assert [row["state"] for row in manager.status()] == [
+        "quarantined", "quarantined", "free", "free", "free",
+    ]
+    manager._unbound_profiles.add(20)
+    assert all(row["state"] == "quarantined" for row in manager.status())
+
+
 def test_abort_response_accepts_only_cleared_terminal_scope(monkeypatch):
     from token_updater import login_slots as module
 
@@ -257,6 +276,25 @@ async def test_restart_reconciliation_revokes_persisted_worker_generation(
     assert manager.owns(55)
     assert manager.status()[0] == {"slot": 1, "state": "quarantined"}
     assert manager._slots == {}
+
+
+@pytest.mark.asyncio
+async def test_empty_but_claimed_slot_is_reserved_without_blocking_other_slots(
+    monkeypatch, tmp_path,
+):
+    from token_updater.database import profile_db
+    _slot_tree(tmp_path, monkeypatch)
+    monkeypatch.setattr(profile_db, "get_all_profiles", AsyncMock(return_value=[{
+        "id": 18, "login_slot_claimed": 1,
+        "login_slot_handoff_complete": 0, "login_slot_number": 1,
+        "login_slot_generation": "retained-generation",
+    }]))
+    manager = LoginSlots()
+    await manager.reconcile()
+    assert manager.status() == [
+        {"slot": 1, "state": "quarantined"},
+        {"slot": 2, "state": "free"},
+    ]
 
 
 @pytest.mark.asyncio

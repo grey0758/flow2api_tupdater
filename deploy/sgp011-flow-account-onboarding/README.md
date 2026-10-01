@@ -91,6 +91,8 @@ and resource limits. The extra core slots use `core3`–`core5` host paths so
 the retained private slot3 sidecar is not touched. Stage those extension
 bundles and verify the host's capacity before enabling the overlay. The
 five-slot overlay is source code until separately deployed and verified.
+An unfinished Profile claim quarantines only its own numbered core slot;
+claims with no trustworthy slot binding still stop all new invitations.
 
 Every mutating stage first requires the exact OpenBao state transition and
 record-to-Profile-to-Token binding. `onboard` additionally passes the expected
