@@ -15,6 +15,60 @@ def test_google_totp_rejects_malformed_seed():
 
 
 @pytest.mark.asyncio
+async def test_labs_sign_in_button_opens_google_before_credentials(monkeypatch):
+    class Field:
+        def __init__(self, page, kind):
+            self.page = page
+            self.kind = kind
+            self.first = self
+        async def wait_for(self, **kwargs):
+            return None
+        async def fill(self, value):
+            self.page.filled.append(self.kind)
+        async def press(self, key):
+            next_url = {
+                "email": "https://accounts.google.com/signin/v2/challenge/pwd",
+                "password": "https://accounts.google.com/signin/v2/challenge/totp",
+                "totp": "https://labs.google/fx",
+            }
+            self.page.url = next_url[self.kind]
+    class Button:
+        def __init__(self, page):
+            self.page = page
+        async def wait_for(self, **kwargs):
+            return None
+        async def click(self):
+            self.page.clicked = True
+            self.page.url = "https://accounts.google.com/signin/v2/identifier"
+    class Page:
+        url = ""
+        def __init__(self):
+            self.clicked = False
+            self.filled = []
+        async def goto(self, url, **kwargs):
+            self.url = "https://labs.google/fx/api/auth/signin?callbackUrl=%2Ffx"
+        def get_by_role(self, role, name):
+            assert (role, name) == ("button", "Sign in with Google")
+            return Button(self)
+        def locator(self, selector):
+            return Field(self, "email" if 'type="email"' in selector else
+                         "password" if 'type="password"' in selector else "totp")
+    page = Page()
+    class Context:
+        async def new_page(self):
+            return page
+    monkeypatch.setattr(module.time, "time", lambda: 0)
+    result = await module.login_google(
+        Context(), "owner@example.invalid", "private",
+        "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+        "https://labs.google/fx/api/auth/signin?callbackUrl=%2Ffx",
+    )
+    assert result == "credentials_submitted"
+    assert page.clicked is True
+    assert page.filled == ["email", "password", "totp"]
+
+
+@pytest.mark.asyncio
 async def test_sms_challenge_remains_visible_without_totp_entry(monkeypatch):
     class Field:
         def __init__(self, page, kind):

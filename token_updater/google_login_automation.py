@@ -49,6 +49,17 @@ async def login_google(context, email: str, password: str, seed: str, auth_url: 
     page = await context.new_page()
     try:
         await page.goto(auth_url, wait_until="domcontentloaded", timeout=90000)
+        current = urlparse(page.url)
+        if current.hostname == "labs.google" and current.path.rstrip("/") == "/fx/api/auth/signin":
+            button = page.get_by_role("button", name="Sign in with Google")
+            await button.wait_for(state="visible", timeout=10000)
+            await button.click()
+            for _ in range(30):
+                if urlparse(page.url).hostname != "labs.google":
+                    break
+                await asyncio.sleep(1)
+            else:
+                return "manual_action_required"
         if urlparse(page.url).hostname != GOOGLE_HOST:
             return "existing_session_or_review"
         if not await _fill_once(page, 'input[type="email"]', email):
