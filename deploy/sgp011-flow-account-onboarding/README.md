@@ -74,15 +74,18 @@ requires a unique completed pending-image evidence directory before changing
 the token/Profile pair and compensates by disabling the token if Profile
 enablement fails.
 
-`batch` accepts only distinct `pending` records. Its actual concurrency is
-the smaller of `--parallel`, five, and the control plane's currently free
-slots. Browser login and project checks run concurrently. Guarded receiver
-sync, paid image acceptance, and activation run serially. Record states mark
-`preparing`, `onboarding_running`, `image_acceptance_running`, and
-`enable_running` before their external side effects; an uncertain result is
-left for operator reconciliation. `image_acceptance_review` must be checked
-against the original root-only report before any further request. Automatic
-challenge handling never bypasses Google's manual checks.
+`batch` accepts only distinct owner-selected `pending` records. Its actual
+concurrency is the smaller of `--parallel`, five, and the control plane's
+currently free slots. Browser login and project checks run concurrently.
+Guarded receiver sync, paid image acceptance, and activation run serially.
+Record states mark `preparing`, `onboarding_running`,
+`image_acceptance_running`, and `enable_running` before their external side
+effects; an uncertain result is left for operator reconciliation. Inspect the
+original root-only host report
+and live token/Profile state before advancing `onboarding_review` or
+`image_acceptance_review`. Never rerun a guarded sync or paid image because a
+caller parser failed. Automatic challenge handling never bypasses Google's
+manual checks.
 
 The 2026-10-01 production deployment exposes five core slots. The
 `docker-compose.login-slots-five.yml` overlay adds three isolated core slots,
@@ -92,25 +95,36 @@ the retained private slot3 sidecar is not touched. Stage those extension
 bundles and verify the host's capacity before enabling the overlay. The
 five-slot overlay is deployed with the production image override in this
 directory. Always pass `-p sgp011-flow2api-token-updater-v34` to Compose so
-the control plane and workers use the same named browser volumes. The current
-readback has core1/2 quarantined and core3/4/5 free, so `batch --parallel 5`
-currently starts at most three visible login attempts. The operator's
-read-only `status` and slot-capacity checks succeeded after cutover; a full
-new-account batch has not yet been run on this release.
+the control plane and workers use the same named browser volumes. Read live
+slot capacity before each batch; an earlier snapshot is not a reservation.
+The first selected new record, account-038, ultimately completed with operator
+intervention. A fully unattended five-account run has not been demonstrated.
 An unfinished Profile claim quarantines only its own numbered core slot;
 claims with no trustworthy slot binding still stop all new invitations.
 
-On 2026-10-02, source commit `b4455c1` corrected the Labs sign-in page
-handoff. The first new batch attempt for account-038 exposed this error before
-the fix. Production core4/5 now run distinct `auto-five-r3-20261002` images
-with the fix; core3 keeps its running r2 image and Profile58's owner invitation
-until that session is finished. The r3 core3 image is built and selected for
-its next safe recreation. Do not recreate core3 merely to apply the image.
-The same Profile58 passed visible Google password/TOTP and reached Labs, but
-Flow/Labs pages later rendered blank in Chromium. Keep it inactive and unsynced
-until the same browser can establish Flow availability, project ownership and
-the guarded admission gates. Its OpenBao record remains `login_invited` with
-`browser_render_review`; there is no Flow token or paid request.
+## 2026-10-02 accepted account and current corrections
+
+Account-038 / Profile58 / Flow token47 completed visible Google/Labs login,
+one Flow project, same-context provider ownership validation, one guarded
+sync, one paid fully decoded image acceptance, and explicit enablement. OpenBao
+is `imported`; do not repeat its sync or image. Its temporary login slot and
+main VNC browser were later closed at the owner's request. See
+`/home/grey/work/sgp_newapi_cliproxy_ops/docs/flow-account038-review-20261002.md`
+for the sanitized case report and root-only report references.
+
+The live core3–5 workers use distinct `auto-five-r4-20261002` images. Commit
+`b4455c1` fixed the Labs Google sign-in entry. Commit `d149d67` prevents an
+embedded Flow/Labs reCAPTCHA frame from masquerading as a Google login
+challenge. The guarded host script from commit `7a9a55a` accepts unrelated
+NewAPI log growth while requiring unchanged control flags and zero
+nonterminal tasks; its installed SHA-256 is
+`ab28bc1cf1c37eb5482734d1b1e19170bf06882dd548216719c4285acd17aa13`.
+Commit `76a0677` fixes the pipeline acceptance parser: the host checker
+already selects one relevant paid NewAPI request, while `newapi_log_rows`
+counts all concurrent rows in the window. The original complete report is
+the acceptance evidence. The four focused test files passed 98 tests on
+2026-10-02. These corrections remove observed false review states; a fresh
+fully unattended batch still needs its own live acceptance evidence.
 
 Every mutating stage first requires the exact OpenBao state transition and
 record-to-Profile-to-Token binding. `onboard` additionally passes the expected
