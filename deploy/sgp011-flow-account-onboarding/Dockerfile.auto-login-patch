@@ -1,0 +1,10 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG WORKER_UID
+
+# Layer the reviewed login entry fix on each distinct production slot image.
+# Keep its existing project validator, extension, and browser runtime intact.
+USER 0
+COPY token_updater/google_login_automation.py /app/token_updater/google_login_automation.py
+RUN python -m py_compile /app/token_updater/google_login_automation.py
+USER ${WORKER_UID}:12000

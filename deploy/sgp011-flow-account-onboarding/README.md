@@ -100,6 +100,18 @@ new-account batch has not yet been run on this release.
 An unfinished Profile claim quarantines only its own numbered core slot;
 claims with no trustworthy slot binding still stop all new invitations.
 
+On 2026-10-02, source commit `b4455c1` corrected the Labs sign-in page
+handoff. The first new batch attempt for account-038 exposed this error before
+the fix. Production core4/5 now run distinct `auto-five-r3-20261002` images
+with the fix; core3 keeps its running r2 image and Profile58's owner invitation
+until that session is finished. The r3 core3 image is built and selected for
+its next safe recreation. Do not recreate core3 merely to apply the image.
+The same Profile58 passed visible Google password/TOTP and reached Labs, but
+Flow/Labs pages later rendered blank in Chromium. Keep it inactive and unsynced
+until the same browser can establish Flow availability, project ownership and
+the guarded admission gates. Its OpenBao record remains `login_invited` with
+`browser_render_review`; there is no Flow token or paid request.
+
 Every mutating stage first requires the exact OpenBao state transition and
 record-to-Profile-to-Token binding. `onboard` additionally passes the expected
 inventory identity only over stdin to the guarded host command; the host
