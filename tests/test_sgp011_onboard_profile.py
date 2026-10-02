@@ -157,3 +157,17 @@ def test_newapi_boundary_counts_only_nonterminal_tasks():
     }
     command = run.call_args.args[0][-1]
     assert "status IS NULL OR status NOT IN ('SUCCESS','FAILURE')" in command
+
+
+def test_newapi_readback_allows_unrelated_logs_but_holds_controls():
+    before = {
+        "max_log": 100,
+        "nonterminal_tasks": 0,
+        "operations_token_enabled": 1,
+        "channel_enabled": 1,
+    }
+    after = dict(before, max_log=207)
+    assert module.newapi_control_unchanged(before, after)
+    assert not module.newapi_control_unchanged(before, dict(after, nonterminal_tasks=1))
+    assert not module.newapi_control_unchanged(before, dict(after, channel_enabled=0))
+    assert not module.newapi_control_unchanged(before, dict(after, max_log=99))

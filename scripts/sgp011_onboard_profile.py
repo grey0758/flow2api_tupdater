@@ -280,6 +280,16 @@ def newapi_boundary() -> dict[str, int]:
     }
 
 
+def newapi_control_unchanged(before: dict[str, int], after: dict[str, int]) -> bool:
+    """Permit unrelated billing logs while holding the admission controls."""
+    return (
+        after["max_log"] >= before["max_log"]
+        and after["nonterminal_tasks"] == 0
+        and after["operations_token_enabled"] == before["operations_token_enabled"]
+        and after["channel_enabled"] == before["channel_enabled"]
+    )
+
+
 def online_backup(profile_id: int, state: dict[str, Any]) -> tuple[Path, dict[str, int]]:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup_dir = BACKUP_ROOT / f"sgp011-account-onboard-P{profile_id}-{stamp}"
@@ -374,7 +384,7 @@ def verify_pending(
             and tasks == 0
         )
         current_boundary = newapi_boundary()
-        accepted = accepted and current_boundary == boundary
+        accepted = accepted and newapi_control_unchanged(boundary, current_boundary)
         if not accepted:
             raise OperatorError(
                 "pending_readback_failed",
