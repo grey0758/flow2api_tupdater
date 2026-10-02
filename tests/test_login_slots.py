@@ -802,6 +802,25 @@ async def test_worker_detects_google_login_challenge_text(monkeypatch, body):
 
 
 @pytest.mark.asyncio
+async def test_worker_ignores_embedded_app_recaptcha(monkeypatch):
+    monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
+    monkeypatch.setenv("LOGIN_SLOT_NUMBER", "3")
+    from token_updater import login_worker as module
+
+    page = SimpleNamespace(
+        url="https://labs.google/fx",
+        frames=[SimpleNamespace(
+            url="https://www.recaptcha.net/recaptcha/api2/anchor"
+        )],
+        locator=lambda _: pytest.fail("app body must not be classified as a login challenge"),
+    )
+    worker = module.LoginWorker()
+    worker.context = SimpleNamespace(pages=[page])
+
+    assert await worker._manual_login_challenge_present() is False
+
+
+@pytest.mark.asyncio
 async def test_worker_manual_challenge_keeps_profile_and_vnc_ready(monkeypatch):
     monkeypatch.setenv("LOGIN_SLOT_SIGNING_PUBLIC_KEY", _keypair()[1])
     monkeypatch.setenv("LOGIN_SLOT_NUMBER", "1")

@@ -10,10 +10,10 @@ services:
   login-egress-5:
     image: flow2api-token-updater-login-worker:secure-final
   login-worker-3:
-    image: flow2api-token-updater-login-worker-core3:auto-five-r3-20261002
+    image: flow2api-token-updater-login-worker-core3:auto-five-r4-20261002
   login-worker-4:
-    image: flow2api-token-updater-login-worker-core4:auto-five-r3-20261002
+    image: flow2api-token-updater-login-worker-core4:auto-five-r4-20261002
   login-worker-5:
-    image: flow2api-token-updater-login-worker-core5:auto-five-r3-20261002
+    image: flow2api-token-updater-login-worker-core5:auto-five-r4-20261002
   token-updater:
     image: flow2api-token-updater-control:auto-five-20261001

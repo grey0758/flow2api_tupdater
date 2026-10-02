@@ -607,16 +607,20 @@ class LoginWorker:
             return False
         for page in list(self.context.pages or []):
             try:
-                urls = [getattr(page, "url", "")]
-                urls.extend(
-                    getattr(frame, "url", "")
-                    for frame in list(getattr(page, "frames", []) or [])
-                )
-                if any(_is_google_login_challenge_url(url) for url in urls):
+                page_url = str(getattr(page, "url", "") or "")
+                parsed = urlparse(page_url)
+                host = str(parsed.hostname or "").lower()
+                if _is_google_login_challenge_url(page_url):
                     return True
-                parsed = urlparse(str(getattr(page, "url", "") or ""))
-                if str(parsed.hostname or "").lower() not in GOOGLE_LOGIN_CHALLENGE_HOSTS:
+                # Flow and Labs embed reCAPTCHA for ordinary app requests.
+                # Its frame URL alone is not an owner login challenge.
+                if host not in GOOGLE_LOGIN_CHALLENGE_HOSTS:
                     continue
+                if any(
+                    _is_google_login_challenge_url(getattr(frame, "url", ""))
+                    for frame in list(getattr(page, "frames", []) or [])
+                ):
+                    return True
                 body = await page.locator("body").inner_text(timeout=3000)
                 normalized = " ".join(str(body or "").lower().split())
                 if any(marker in normalized for marker in GOOGLE_LOGIN_CHALLENGE_MARKERS):
