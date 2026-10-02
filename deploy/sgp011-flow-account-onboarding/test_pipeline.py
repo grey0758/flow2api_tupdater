@@ -172,7 +172,7 @@ def test_completed_image_report_is_reconciled_without_a_second_request(tmp_path)
             "flow_token_id": 43, "newapi_http": 200, "media_http": 200,
             "image_format": "JPEG", "width": 1376, "height": 768,
             "bytes": 405251, "flow_log_id": 24635, "newapi_log_id": 52900,
-            "newapi_log_rows": 1,
+            "newapi_log_rows": 14,
         }],
     }
     (folder / "result.json").write_text(json.dumps(report))

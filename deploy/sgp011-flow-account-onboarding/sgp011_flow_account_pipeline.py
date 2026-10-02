@@ -459,7 +459,10 @@ for name in glob.glob("/home/grey/backups/sgp011-flow-account-health-*/result.js
             and isinstance(item.get("bytes"), int) and item["bytes"] > 0
             and isinstance(item.get("flow_log_id"), int)
             and isinstance(item.get("newapi_log_id"), int)
-            and item.get("newapi_log_rows") == 1
+            # The host checker already requires exactly one relevant paid
+            # request ID. This field counts every concurrent NewAPI log row.
+            and isinstance(item.get("newapi_log_rows"), int)
+            and item["newapi_log_rows"] >= 1
         )
         if required:
             accepted.append((path.parent.name, item))
