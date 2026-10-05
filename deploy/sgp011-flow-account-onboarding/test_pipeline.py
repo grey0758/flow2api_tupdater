@@ -149,6 +149,39 @@ def test_batch_caps_active_profiles_at_five(monkeypatch):
     assert counts["peak"] == 5
 
 
+def test_batch_stops_before_paid_admission(monkeypatch):
+    class FakeBao:
+        def get(self, record_id):
+            return ({"RECORD_ID": record_id, "STATUS": "pending",
+                     "EMAIL": "owner@example.invalid", "PASSWORD": "private",
+                     "TOTP_SECRET": "PRIVATESEED"}, 1)
+        def transition(self, record_id, expected, fields):
+            transitions.append((expected, fields["STATUS"]))
+            return len(transitions) + 1
+    transitions = []
+    monkeypatch.setattr(MODULE, "OpenBao", FakeBao)
+    monkeypatch.setattr(MODULE, "prepare_remote", lambda name: {
+        "profile_id": 61, "slot": 1, "invite_url": "https://example.invalid/login-slots#private"})
+    monkeypatch.setattr(MODULE, "auto_login_remote", lambda profile, data: {"success": True})
+    monkeypatch.setattr(MODULE, "command_onboard", lambda args: pytest.fail("sync attempted"))
+    monkeypatch.setattr(MODULE, "command_accept", lambda args: pytest.fail("paid image attempted"))
+    result = MODULE._batch_record("account-041", threading.Lock())
+    assert result["status"] == "ready_for_pro_redemption"
+    assert transitions == [("pending", "preparing"), ("preparing", "login_invited"),
+                           ("login_invited", "ready_for_pro_redemption")]
+
+
+def test_onboard_requires_pro_verification_before_remote_side_effect(monkeypatch):
+    class FakeBao:
+        def get(self, record_id):
+            return ({"RECORD_ID": record_id, "STATUS": "ready_for_pro_redemption",
+                     "PROFILE_ID": "61", "EMAIL": "owner@example.invalid"}, 1)
+    monkeypatch.setattr(MODULE, "OpenBao", FakeBao)
+    monkeypatch.setattr(MODULE, "run", lambda *args, **kwargs: pytest.fail("remote sync attempted"))
+    with pytest.raises(MODULE.PipelineError, match="record_stage_mismatch"):
+        MODULE.command_onboard(Namespace(record_id="account-041", profile_id=61))
+
+
 def test_stage_transition_refuses_a_changed_record_before_side_effect(monkeypatch):
     bao = object.__new__(MODULE.OpenBao)
     bao.token = "test-token"

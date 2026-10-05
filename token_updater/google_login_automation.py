@@ -62,7 +62,7 @@ async def login_google(context, email: str, password: str, seed: str, auth_url: 
                 return "manual_action_required"
         if urlparse(page.url).hostname != GOOGLE_HOST:
             return "existing_session_or_review"
-        if not await _fill_once(page, 'input[type="email"]', email):
+        if not await _fill_once(page, 'input[name="identifier"], input[type="email"]', email):
             return "manual_action_required"
         if not await _fill_once(page, 'input[type="password"]', password):
             return "manual_action_required"

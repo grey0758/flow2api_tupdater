@@ -376,7 +376,7 @@ def command_onboard(args: argparse.Namespace) -> dict[str, Any]:
     bao = OpenBao()
     data, _ = bao.get(record_id)
     prior_status = str(data.get("STATUS") or "")
-    if prior_status not in {"login_invited", "ready_to_onboard"}:
+    if prior_status != "pro_verified":
         raise PipelineError("record_stage_mismatch")
     expected_identity = require_record_binding(
         record_id,
@@ -723,7 +723,60 @@ def slot_capacity_remote() -> dict[str, int]:
     return reply
 
 
-def _batch_record(record_id: str, admission_lock: threading.Lock) -> dict[str, Any]:
+RECOVER_HELPER = r'''
+import json, os, sys, urllib.request
+number, profile_id = map(int, sys.argv[1:])
+base = "http://127.0.0.1:8002"
+def call(method, path, body=None, token=""):
+    headers = {"Content-Type": "application/json"}
+    if token: headers["X-Flow-Updater-Authorization"] = "Bearer " + token
+    payload = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(base + path, data=payload, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=180) as response: return json.load(response)
+session = call("POST", "/api/login", {"password": os.environ["ADMIN_PASSWORD"]})["token"]
+try:
+    result = call("POST", f"/api/login-slots/{number}/recover/{profile_id}", token=session)
+    print(json.dumps({"slot": number, "profile_id": profile_id,
+                      "invite_url": result["invite_url"],
+                      "expires_at": result["expires_at"]}, separators=(",", ":")))
+finally:
+    try: call("POST", "/api/logout", token=session)
+    except Exception: pass
+'''
+
+
+def command_recover_login(args: argparse.Namespace) -> dict[str, Any]:
+    record_id = validate_record_id(args.record_id)
+    bao = OpenBao()
+    data, _ = bao.get(record_id)
+    require_record_binding(record_id, data, status="login_invited",
+                           profile_id=args.profile_id)
+    slot = int(data.get("LOGIN_SLOT") or 0)
+    if slot not in range(1, 6):
+        raise PipelineError("record_slot_invalid")
+    result = run(
+        ["ssh-1p", "sgp011", "sudo", "docker", "exec", "-i",
+         "sgp011-flow2api-token-updater-v34", "python", "-",
+         str(slot), str(args.profile_id)],
+        input_text=RECOVER_HELPER, timeout=240,
+    )
+    if result.returncode:
+        raise PipelineError("slot_recovery_review")
+    reply = parse_last_json(result.stdout)
+    relative = str(reply.get("invite_url") or "")
+    parts = relative.split("#", 1)
+    if (reply.get("slot") != slot or reply.get("profile_id") != args.profile_id
+            or len(parts) != 2 or parts[0] != "/login-slots"
+            or not CAPABILITY_RE.fullmatch(parts[1])):
+        raise PipelineError("slot_recovery_reply_invalid")
+    delivered = send_invitation(record_id, args.profile_id, slot,
+                                urljoin(PUBLIC_UPDATER, relative))
+    return {"success": True, "record_id": record_id,
+            "profile_id": args.profile_id, "slot": slot,
+            "invitation_delivered": delivered["provider_accepted"]}
+
+
+def _batch_record(record_id: str, _admission_lock: threading.Lock) -> dict[str, Any]:
     profile_id = None
     try:
         bao = OpenBao()
@@ -751,23 +804,10 @@ def _batch_record(record_id: str, admission_lock: threading.Lock) -> dict[str, A
                     "status": "manual_review", "error_code": code,
                     "invitation_delivered": delivered["provider_accepted"]}
         bao.transition(record_id, "login_invited", {
-            "STATUS": "ready_to_onboard", "LOGIN_VALIDATED_AT": utc_now(),
+            "STATUS": "ready_for_pro_redemption", "LOGIN_VALIDATED_AT": utc_now(),
         })
-        # Receiver sync, paid image, and activation mutate shared state. Keep
-        # these stages serial even while up to five browser logins run.
-        with admission_lock:
-            onboard = command_onboard(argparse.Namespace(
-                record_id=record_id, profile_id=profile_id,
-            ))
-            token_id = int(onboard["flow_token_id"])
-            command_accept(argparse.Namespace(
-                record_id=record_id, profile_id=profile_id, token_id=token_id,
-            ))
-            command_enable(argparse.Namespace(
-                record_id=record_id, profile_id=profile_id, token_id=token_id,
-            ))
         return {"record_id": record_id, "profile_id": profile_id,
-                "flow_token_id": token_id, "status": "imported"}
+                "status": "ready_for_pro_redemption"}
     except PipelineError as exc:
         return {"record_id": record_id, "profile_id": profile_id,
                 "status": "review", "error_code": exc.code}
@@ -790,9 +830,52 @@ def command_batch(args: argparse.Namespace) -> dict[str, Any]:
                    for item in record_ids}
         results = [future.result() for future in as_completed(futures)]
     results.sort(key=lambda item: item["record_id"])
-    return {"success": all(item["status"] == "imported" for item in results),
+    return {"success": all(item["status"] in {"ready_for_pro_redemption", "imported"}
+                           for item in results),
             "requested_parallel": args.parallel, "active_parallel": parallel,
             "results": results}
+
+
+def command_resume_login(args: argparse.Namespace) -> dict[str, Any]:
+    """Resume an existing invitation without rotating its owner capability."""
+    record_id = validate_record_id(args.record_id)
+    bao = OpenBao()
+    data, _ = bao.get(record_id)
+    require_record_binding(record_id, data, status="login_invited",
+                           profile_id=args.profile_id)
+    result = auto_login_remote(args.profile_id, data)
+    data.clear()
+    if result.get("success") is not True:
+        code = str(result.get("error_code") or "login_review")[:64]
+        bao.transition(record_id, "login_invited", {"LOGIN_ERROR_CODE": code})
+        return {"success": False, "record_id": record_id,
+                "profile_id": args.profile_id, "error_code": code}
+    bao.transition(record_id, "login_invited", {
+        "STATUS": "ready_for_pro_redemption", "LOGIN_VALIDATED_AT": utc_now(),
+    })
+    return {"success": True, "record_id": record_id,
+            "profile_id": args.profile_id, "status": "ready_for_pro_redemption"}
+
+
+def command_confirm_pro(args: argparse.Namespace) -> dict[str, Any]:
+    """Record operator-observed Google One and Flow PRO gates before sync."""
+    record_id = validate_record_id(args.record_id)
+    if not args.google_one_confirmed or not args.flow_pro_confirmed:
+        raise PipelineError("pro_evidence_incomplete")
+    bao = OpenBao()
+    data, _ = bao.get(record_id)
+    require_record_binding(record_id, data, status="ready_for_pro_redemption",
+                           profile_id=args.profile_id)
+    if not str(data.get("PRO_REDEMPTION_URL") or "").startswith("https://"):
+        raise PipelineError("pro_redemption_url_missing")
+    now = utc_now()
+    version = bao.transition(record_id, "ready_for_pro_redemption", {
+        "STATUS": "pro_verified", "PRO_GOOGLE_ONE_VERIFIED_AT": now,
+        "PRO_FLOW_VERIFIED_AT": now,
+    })
+    return {"success": True, "record_id": record_id,
+            "profile_id": args.profile_id, "openbao_version": version,
+            "status": "pro_verified"}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -835,6 +918,29 @@ def parser() -> argparse.ArgumentParser:
     enable.add_argument("--profile-id", required=True, type=int)
     enable.add_argument("--token-id", required=True, type=int)
     enable.set_defaults(handler=command_enable)
+
+    resume = commands.add_parser(
+        "resume-login", help="resume an existing invited Profile without issuing another link"
+    )
+    resume.add_argument("--record-id", required=True)
+    resume.add_argument("--profile-id", required=True, type=int)
+    resume.set_defaults(handler=command_resume_login)
+
+    recover = commands.add_parser(
+        "recover-login", help="reopen an original quarantined slot and send its rotated invitation"
+    )
+    recover.add_argument("--record-id", required=True)
+    recover.add_argument("--profile-id", required=True, type=int)
+    recover.set_defaults(handler=command_recover_login)
+
+    pro = commands.add_parser(
+        "confirm-pro", help="record visually verified Google One and Flow PRO"
+    )
+    pro.add_argument("--record-id", required=True)
+    pro.add_argument("--profile-id", required=True, type=int)
+    pro.add_argument("--google-one-confirmed", action="store_true")
+    pro.add_argument("--flow-pro-confirmed", action="store_true")
+    pro.set_defaults(handler=command_confirm_pro)
 
     batch = commands.add_parser(
         "batch", help="automate distinct fresh accounts with at most five visible slots"

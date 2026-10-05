@@ -28,12 +28,18 @@ The reusable pipeline is:
    and validate the same browser's identity and provider project membership.
    Send the memory-only invitation through personal WeCom if intervention is
    needed.
-4. After the supported Profile handoff, run exactly one guarded
+4. Stop at `ready_for_pro_redemption`. Redeem the account's own PRO link in
+   its authenticated Profile. Verify the exact identity has Google One AI Pro
+   and Flow PRO; if the VNC site fails, use a separate local Chrome Profile
+   with the same extension and approved egress for that identity, then return
+   to the retained Updater Profile. Record both observed gates with
+   `confirm-pro`. Never infer PRO from a successful login or an empty popup.
+5. After the supported Profile handoff and PRO verification, run exactly one guarded
    `sudo /usr/local/sbin/sgp011-flow-onboard-profile <PROFILE_ID>`.
-5. For the returned disabled pending Flow token, run exactly one
+6. For the returned disabled pending Flow token, run exactly one
    `sudo /usr/local/sbin/sgp011-flow-account-health-run --pending-token-id
    <FLOW_TOKEN_ID>`.
-6. Enable the Flow token and Updater Profile through their supported APIs only
+7. Enable the Flow token and Updater Profile through their supported APIs only
    after the pending image report passes unique Flow/NewAPI attribution and
    complete image decode.
 
@@ -60,6 +66,9 @@ their risk boundaries:
 ```text
 sgp011_flow_account_pipeline.py status
 sgp011_flow_account_pipeline.py batch --parallel 5 account-NNN account-MMM
+sgp011_flow_account_pipeline.py resume-login --record-id account-NNN --profile-id <PROFILE_ID>
+sgp011_flow_account_pipeline.py recover-login --record-id account-NNN --profile-id <PROFILE_ID>
+sgp011_flow_account_pipeline.py confirm-pro --record-id account-NNN --profile-id <PROFILE_ID> --google-one-confirmed --flow-pro-confirmed
 sgp011_flow_account_pipeline.py prepare-invite --record-id account-NNN --profile-name <NAME>
 sgp011_flow_account_pipeline.py onboard --record-id account-NNN --profile-id <PROFILE_ID>
 sgp011_flow_account_pipeline.py accept --record-id account-NNN --profile-id <PROFILE_ID> --token-id <FLOW_TOKEN_ID>
@@ -74,10 +83,15 @@ requires a unique completed pending-image evidence directory before changing
 the token/Profile pair and compensates by disabling the token if Profile
 enablement fails.
 
-`batch` accepts only distinct owner-selected `pending` records. Its actual
+`batch` accepts only distinct owner-selected `pending` records. It stops after
+visible login, project validation and supported handoff, before PRO redemption,
+receiver sync, paid image or activation. `resume-login` continues a retained
+`login_invited` Profile without rotating its owner invitation. `onboard` only
+accepts `pro_verified`; `confirm-pro` records the two operator-observed gates
+after real redemption. Its actual
 concurrency is the smaller of `--parallel`, five, and the control plane's
 currently free slots. Browser login and project checks run concurrently.
-Guarded receiver sync, paid image acceptance, and activation run serially.
+Run guarded receiver sync, paid image acceptance, and activation serially.
 Record states mark `preparing`, `onboarding_running`,
 `image_acceptance_running`, and `enable_running` before their external side
 effects; an uncertain result is left for operator reconciliation. Inspect the
@@ -101,6 +115,48 @@ The first selected new record, account-038, ultimately completed with operator
 intervention. A fully unattended five-account run has not been demonstrated.
 An unfinished Profile claim quarantines only its own numbered core slot;
 claims with no trustworthy slot binding still stop all new invitations.
+
+## 2026-10-04 PRO redemption batch
+
+The ten owner-selected records are account-039 through account-048. Records
+039/040 and 045 completed Google One AI Pro and Flow PRO verification, one
+guarded sync, one decoded paid image each, enablement, and OpenBao `imported`.
+Account-045 is Profile64 / Flow token50, with its single accepted image at
+Flow log35630 / NewAPI log67950, 1376×768. The account-039 and account-040
+accepted reports are retained separately under the root-only backup tree.
+
+Records 041–044 completed their own Google/Labs login and no-cost Flow project
+handoff in Profiles65/61/63/62. Their links reported `Subscription already in
+use`; each exact Google One account still showed free 15 GB and Upgrade.
+Records 046–048 likewise completed no-cost handoff in Profiles66/68/67, but
+the redemption service reported `Failed to fetch fresh link`, and Google's
+old link said `You need a new activation link`. All seven are
+`ready_for_pro_redemption`, with no Flow token, receiver sync, paid image or
+scheduler enablement. The short error classification is stored in OpenBao
+without persisting a private link. Provide fresh links before `confirm-pro`;
+never interpret a used link as evidence that the current Google identity has
+PRO.
+
+One valid offer, account-045, rendered its `Activate plan` button in the DOM
+below the VNC viewport. The empty `span.UTNHae` was unrelated. The protected
+operator helper can trigger the exact control on the official
+`one.google.com/activate-plan/` page in that same visible Profile; the final
+Google One member confirmation and Flow PRO/credits must still be observed.
+The local Chrome147/YesCaptcha fallback remains isolated under
+`/home/grey/backups/flow-account039-local-chrome-20261004`, using a separate
+Chrome Profile per identity and the in-memory OpenBao key. Do not copy its
+private browser data or screenshots into Git.
+
+The Google email field now accepts `input[name="identifier"]` as well as
+`input[type="email"]`. The five production workers were layered from their
+distinct original images, retaining each validator, and use 512 PIDs/4 GiB
+memory to avoid the observed 320 PID and 2 GiB Chromium crashes. The source
+overlay is `compose.pro-redemption-workers.yaml`; production copy is under
+`/opt/flow2api-token-updater-v34`. Continue passing the full Compose stack
+and the exact project name. A crashed browser must be recovered through its
+original quarantined slot after checking the claimed Profile and owner
+session; a control restart revokes all live invitations and is only safe
+after every other active slot has completed.
 
 ## 2026-10-02 accepted account and current corrections
 
